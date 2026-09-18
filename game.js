@@ -1,0 +1,450 @@
+(()=>{
+'use strict';
+// 启动菜单的全局安全桥：即使按钮事件被浏览器/缓存环境干扰，也能直接调用游戏动作。
+window.__bootAction=function(action){
+  try{
+    if(action==='new'){newGame();return true}
+    if(action==='load'){loadGame();return true}
+    if(action==='end'){toast('游戏结束');returnMenu();return true}
+    if(action==='start'){startGame();return true}
+  }catch(err){
+    console.error('menu action failed',err);
+    const box=document.getElementById('start');
+    if(box)box.classList.remove('hidden');
+    const title=document.getElementById('startTitle');
+    const desc=document.getElementById('startDesc');
+    if(title)title.textContent='启动失败';
+    if(desc)desc.innerHTML='游戏启动时发生错误：'+String(err&&err.message||err)+'<br>请再次点击“新游戏”。';
+  }
+  return false;
+};
+const c=document.getElementById('game'),ctx=c.getContext('2d');
+const W=c.width,H=c.height,TAU=Math.PI*2;
+const MAP_W=2048,MAP_H=1143,MAP_MIN_X=-MAP_W/2,MAP_MAX_X=MAP_W/2,MAP_MIN_Y=-MAP_H/2,MAP_MAX_Y=MAP_H/2;
+const keys=Object.create(null);let started=false,last=0,toastTimer=0,uPressed=false,loopToken=0,timeAccumulator=0,paused=false;
+const storage={get(k){try{return window.localStorage.getItem(k)}catch(e){try{return window.sessionStorage.getItem(k)}catch(_){return null}}},set(k,v){try{window.localStorage.setItem(k,v);return true}catch(e){try{window.sessionStorage.setItem(k,v);return true}catch(_){return false}}},remove(k){try{window.localStorage.removeItem(k);return true}catch(e){try{window.sessionStorage.removeItem(k);return true}catch(_){return false}}}};
+addEventListener('keydown',e=>{
+  // 升级/里程碑界面优先截获 1/2/3，绝不触发武器切换。
+  if(game.levelChoices&&game.levelChoices!=='MILESTONE'){
+    const map={Digit1:0,Digit2:1,Digit3:2,Numpad1:0,Numpad2:1,Numpad3:2};
+    if(Object.prototype.hasOwnProperty.call(map,e.code)){selectChoice(map[e.code]);e.preventDefault();return}
+  }
+  if(game.levelChoices==='MILESTONE'&&(e.code==='Digit1'||e.code==='Numpad1'||e.code==='Digit2'||e.code==='Numpad2')){milestoneChoice(e.code==='Digit1'||e.code==='Numpad1');e.preventDefault();return}
+  keys[e.code]=true;
+  if(['Digit1','Digit2','Digit3','Numpad1','Numpad2','Numpad3'].includes(e.code)){
+    switchWeapon(Number(e.code.replace('Digit','').replace('Numpad',''))-1);e.preventDefault();return
+  }
+  if(e.code==='KeyF'&&started)interactShop();
+  if(e.code==='KeyP'&&started&&!paused){saveGame(true);e.preventDefault()}
+  if(e.code==='Escape'&&started){togglePause();e.preventDefault()}
+  if(e.code==='KeyM'&&started){returnMenu();e.preventDefault()}
+  if(['Space','KeyW','KeyA','KeyS','KeyD','KeyE','KeyF','Digit1','Digit2','Digit3','KeyP','KeyM','Escape'].includes(e.code))e.preventDefault();
+  if(e.code==='Enter'&&!started)startGame()
+});
+addEventListener('keyup',e=>keys[e.code]=false);
+['startBtn','newBtn','loadBtn','endBtn'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.pointerEvents='auto'});
+const bind=(id,fn)=>{const el=document.getElementById(id);if(el)el.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();try{fn()}catch(err){console.error(err)}})};
+bind('startBtn',startGame);bind('newBtn',newGame);bind('loadBtn',loadGame);bind('endBtn',()=>{toast('游戏结束');returnMenu()});bind('pauseBtn',togglePause);bind('resumeBtn',resumeGame);bind('pauseSaveBtn',()=>saveGame(true));bind('pauseMenuBtn',returnMenu);setTimeout(updateSaveLabel,0);
+c.addEventListener('click',e=>{if(!game.levelChoices)return;const r=c.getBoundingClientRect();const x=(e.clientX-r.left)*W/r.width,y=(e.clientY-r.top)*H/r.height;if(game.levelChoices==='GAMEOVER'){if(y>=350&&y<=460){if(x>=W/2-270&&x<=W/2-30){game.levelChoices=null;startGame()}else if(x>=W/2+30&&x<=W/2+270){game.levelChoices=null;returnMenu()}}return}if(!Array.isArray(game.levelChoices))return;const cw=300,ch=220,gap=24,start=W/2-(cw*3+gap*2)/2;if(y>=220&&y<=440){for(let i=0;i<3;i++){const bx=start+i*(cw+gap);if(x>=bx&&x<=bx+cw){selectChoice(i);break}}}});
+const imgs=[];for(let i=0;i<24;i++){const im=new Image();im.src=`assets/sprites/f${String(i).padStart(2,'0')}.png`;imgs.push(im)}
+const arrowImg=new Image();arrowImg.src='assets/weapon/arrow.png';
+const staffSnowflakeImg=new Image();staffSnowflakeImg.src='assets/weapon/staff_snowflake.png';
+const battleBgImg=new Image();battleBgImg.src='assets/battle_map.png';battleBgImg.onerror=()=>{battleBgImg.onerror=null;battleBgImg.src='battle_map.png'};
+const mushroomEnemyImg=new Image();mushroomEnemyImg.src='assets/mushroom_enemy.png';
+const normalEnemyImg=new Image();normalEnemyImg.src='assets/enemies/normal_slime.png';
+const eliteEnemyImg=new Image();eliteEnemyImg.src='assets/enemies/elite_goblin.png';
+const bossEnemyImg=new Image();bossEnemyImg.src='assets/enemies/boss_tree.png';
+const weaponImgs={bow:[],staff:[],katana:[]};
+for(const wid of Object.keys(weaponImgs)){for(let i=0;i<7;i++){const im=new Image();im.src=`assets/weapon/${wid}${String(i).padStart(2,'0')}.png`;weaponImgs[wid].push(im)}}
+const weaponDefs={
+ bow:{name:'月弦长弓',short:'弓箭',color:'#78dfff',rate:.85,range:420,damage:1,kind:'bow'},
+ staff:{name:'霜月法杖',short:'法杖',color:'#a98cff',rate:.5,range:180,damage:1,kind:'staff'},
+ katana:{name:'九尾太刀',short:'太刀',color:'#ff8fc1',rate:1.2,range:145,damage:1,kind:'katana'}
+};
+const weaponOrder=['bow','staff','katana'];
+function xpNeededForLevel(targetLevel){const L=Math.max(2,Math.floor(Number(targetLevel)||2));const n=L-1;return Math.max(1,Math.round(130+15*n+2.5*n*n))}
+
+const player={x:150,y:0,r:24,hp:100,maxHp:100,lv:1,xp:0,next:130,atk:10,speed:270,energy:0,attackCd:.2,faceX:1,faceY:0,anim:0,hitFlash:0,skillAnim:0,inv:0,dodge:0,crit:.08,critDamage:1.5,magnet:105,weapon:'bow',unlocked:{bow:true},weaponLv:{bow:1,staff:1,katana:1},weaponKills:{bow:0,staff:0,katana:0},damageBonus:0,rateBonus:0,rangeBonus:0,projectileBonus:0,energyBonus:0,ultimateBonus:0,reduction:0,skillPower:1,bowPierce:0,bowBleed:false,bowScatter:0,bowMastery:0,staffPillars:5,staffFreeze:0,staffLightning:0,staffMastery:0,katanaCharge:false,katanaShield:0,katanaWeak:0,katanaMastery:0,katanaFlash:0,flameRelic:0,lightningRelic:0,iceRelic:0,dodgeRelic:0,coins:0,skillLevels:{},attackAnim:0,attackFrame:0,attackDuration:.3,katanaChargeStart:0,katanaChargeTime:0,katanaHitCount:0,katanaLastBossHit:0,bowPowerBonus:0,bowRateBonus:0,staffDamageBonus:0,staffRateBonus:0,katanaDamageBonus:0,katanaRateBonus:0,katanaBossBonus:0,shopBuys:{},lifesteal:0}
+const arena={x:0,y:0};
+const game={wave:1,waveTime:0,waveDuration:20,kills:0,enemies:[],shots:[],orbs:[],chests:[],drops:[],particles:[],slashes:[],texts:[],boss:null,spawnTimer:.3,shake:0,score:0,levelChoices:null,elapsed:0,forestSeed:1,lastSaveWave:0,completedWaves:0,menu:false,shop:null,shopBusy:false};
+
+const universalSkills=[];
+const ascensionSkills={};
+// V32 全新武器天赋池：每次升级都会有可选项，且按当前武器独立成长。
+const weaponSkills={
+ bow:[
+  {id:'bow_power',name:'弓弦强化',maxLv:20,unlock:1,desc:'基础伤害 +1。',apply(){player.bowPowerBonus=(player.bowPowerBonus||0)+1;toast('弓箭·基础伤害 +1')}},
+  {id:'bow_speed',name:'疾射',maxLv:10,unlock:1,desc:'弓箭攻击速度 +5%。',apply(){player.bowRateBonus=Math.min(.65,(player.bowRateBonus||0)+.05);toast('弓箭·攻击速度 +5%')}},
+  {id:'bow_range',name:'鹰眼',maxLv:10,unlock:1,desc:'弓箭射程 +5%。',apply(){player.rangeBonus=(player.rangeBonus||0)+21;toast('弓箭·射程 +5%')}},
+  {id:'bow_pierce',name:'穿透攻击',maxLv:20,unlock:5,desc:'每级 +1 次穿透，伤害不衰减，最高20次。',apply(){player.bowPierce=Math.min(20,(player.bowPierce||0)+1);toast(`弓箭·穿透 ${player.bowPierce}/20`)}},
+  {id:'bow_scatter',name:'散射',maxLv:1,unlock:20,desc:'20级解锁：一次发射3箭，每箭继承穿透。',apply(){player.bowScatter=3;toast('弓箭·散射解锁！')}},
+  {id:'bow_mastery',name:'弓箭精通',maxLv:1,unlock:20,desc:'散射升至5箭；所有箭继承穿透与流血；对小怪伤害 +30%。',apply(){player.bowMastery=1;player.bowScatter=5;toast('弓箭·精通解锁！')}}
+ ],
+ staff:[
+  {id:'staff_power',name:'寒霜强化',maxLv:20,unlock:1,desc:'冰柱单次伤害 +1。',apply(){player.staffDamageBonus=(player.staffDamageBonus||0)+1;toast('法杖·冰柱伤害 +1')}},
+  {id:'staff_speed',name:'旋流',maxLv:10,unlock:1,desc:'冰柱旋转速度 +5%。',apply(){player.staffRateBonus=Math.min(.7,(player.staffRateBonus||0)+.05);toast('法杖·旋转速度 +5%')}},
+  {id:'staff_freeze',name:'寒冰刻印',maxLv:5,unlock:5,desc:'解锁/强化冻结：命中有10%概率冻结1秒。每级提高冻结持续时间0.2秒。',apply(){player.staffFreeze=Math.min(5,(player.staffFreeze||0)+1);toast(`法杖·冻结 Lv.${player.staffFreeze}/5`)}},
+  {id:'staff_pillar',name:'冰柱升级',maxLv:2,unlock:5,desc:'每级增加1根冰柱，最高7根。',apply(){player.staffPillars=Math.min(7,(player.staffPillars||5)+1);player.staffFreeze=Math.max(1,player.staffFreeze||0);toast(`法杖·冰柱 ${player.staffPillars} 根`)}},
+  {id:'staff_lightning',name:'闪电散射',maxLv:5,unlock:15,desc:'冻结后触发闪电链，最高5条；闪电命中可扩散感电。',apply(){player.staffLightning=Math.min(5,(player.staffLightning||0)+1);toast(`法杖·闪电链 ${player.staffLightning}/5`)}},
+  {id:'staff_mastery',name:'法杖精通',maxLv:1,unlock:20,desc:'冰柱命中Boss触发水波纹；闪电10%概率感电，Boss受到伤害 +20%；冰冻小怪击杀概率掉落净化水。',apply(){player.staffMastery=1;toast('法杖·精通解锁！')}}
+ ],
+ katana:[
+  {id:'katana_power',name:'斩击强化',maxLv:20,unlock:1,desc:'太刀基础斩击伤害 +2。',apply(){player.katanaDamageBonus=(player.katanaDamageBonus||0)+2;toast('太刀·斩击伤害 +2')}},
+  {id:'katana_speed',name:'疾风刀势',maxLv:10,unlock:1,desc:'太刀攻击速度 +5%。',apply(){player.katanaRateBonus=Math.min(.65,(player.katanaRateBonus||0)+.05);toast('太刀·攻击速度 +5%')}},
+  {id:'katana_boss',name:'猎王',maxLv:10,unlock:1,desc:'对Boss伤害 +4%。',apply(){player.katanaBossBonus=(player.katanaBossBonus||0)+.04;toast('太刀·Boss伤害 +4%')}},
+  {id:'katana_charge',name:'蓄力重斩',maxLv:1,unlock:5,desc:'长按/自动蓄力0.5秒，伤害翻倍；命中Boss累积破盾，破盾后硬直。',apply(){player.katanaCharge=true;toast('太刀·蓄力重斩解锁！')}},
+  {id:'katana_weak',name:'弱点标记',maxLv:1,unlock:15,desc:'连续3次命中Boss触发弱点标记，造成Boss已损生命值5%的真实伤害。',apply(){player.katanaWeak=1;toast('太刀·弱点标记解锁！')}},
+  {id:'katana_mastery',name:'太刀精通·一闪',maxLv:1,unlock:20,desc:'每击杀10只小怪或对Boss造成1000伤害攒1层，最高5层；Boss低于15%生命可斩杀。',apply(){player.katanaMastery=1;toast('太刀·精通：一闪解锁！')}}
+ ]
+};
+function skillsForCurrentWeapon(){const wid=player.weapon,lv=player.weaponLv[wid]||1;return (weaponSkills[wid]||[]).filter(s=>lv>=(s.unlock||1)&&(player.skillLevels[s.id]||0)<(s.maxLv||1));}
+function switchWeapon(i){if(game.levelChoices!==null)return;const id=weaponOrder[i];if(!id||!player.unlocked[id])return;player.weapon=id;player.ascCharge=0;toast(`切换武器：${weaponDefs[id].name}`)}
+
+
+function skillTag(s){for(const [wid,list] of Object.entries(weaponSkills)){if(list.some(x=>x.id===s.id))return weaponDefs[wid]?.short||wid}return '通用天赋'}
+function startGame(){loopToken++;started=true;paused=false;game.menu=false;const ov=document.getElementById('pauseOverlay');if(ov){ov.classList.add('hidden');ov.style.display='grid';ov.style.pointerEvents='auto'}const pb=document.getElementById('pauseBtn');if(pb){pb.textContent='暂停';pb.style.display='block';pb.style.pointerEvents='auto'}document.getElementById('start').classList.add('hidden');document.getElementById('menuMain').classList.remove('hidden');document.getElementById('menuGame').classList.add('hidden');resetGame();last=performance.now();timeAccumulator=0;requestAnimationFrame(t=>loop(t,loopToken))}
+function newGame(){storage.remove('kitsune_guard_save_v15');startGame()}
+function togglePause(){if(!started||game.menu)return;paused=!paused;last=performance.now();timeAccumulator=0;const ov=document.getElementById('pauseOverlay');if(ov)ov.classList.toggle('hidden',!paused);const pb=document.getElementById('pauseBtn');if(pb)pb.textContent=paused?'继续游戏':'暂停';toast(paused?'游戏已暂停 · 可以放心离开处理事情':'继续战斗！')}
+function resumeGame(){if(paused)togglePause()}
+function returnMenu(){loopToken++;started=false;paused=false;game.menu=true;last=performance.now();timeAccumulator=0;const ov=document.getElementById('pauseOverlay');if(ov){ov.classList.add('hidden');ov.style.display='none';ov.style.pointerEvents='none'}const pb=document.getElementById('pauseBtn');if(pb){pb.textContent='暂停';pb.style.display='none';pb.style.pointerEvents='none'}drawMenuForest();const start=document.getElementById('start');if(start){start.classList.remove('hidden');start.style.display='grid';start.style.pointerEvents='auto'}document.getElementById('startTitle').textContent='守卫月影森林';document.getElementById('startDesc').innerHTML='2D 俯视角无尽生存 · 小型封闭森林地图 · 纯生存挑战。<br>击杀敌人、升级武器与天赋；每 10 波 Boss 登场。';document.getElementById('menuMain').classList.remove('hidden');document.getElementById('menuGame').classList.add('hidden');document.getElementById('menuHelp').classList.remove('hidden');updateSaveLabel()}
+function loadGame(){const raw=storage.get('kitsune_guard_save_v15');if(!raw){toast('没有可读取的存档');return}try{const d=JSON.parse(raw);Object.assign(player,d.player);player.crit=Math.min(1,Math.max(0,Number(player.crit)||.08));player.critDamage=Math.max(1.5,Number(player.critDamage)||1.5);player.maxHp=Math.max(1,Number(player.maxHp)||100);player.hp=Math.min(player.maxHp,Number(player.hp)||player.maxHp);player.next=xpNeededForLevel(player.lv);Object.assign(game,d.game);game.menu=false;for(const id of Object.keys(weaponDefs))player.weaponLv[id]=Math.min(20,Math.max(1,player.weaponLv[id]||1));for(const id of Object.keys(player.skillLevels||{})){const all=Object.values(weaponSkills).flat();const sk=all.find(x=>x.id===id);const max=sk?sk.maxLv:0;player.skillLevels[id]=Math.min(max,Math.max(0,player.skillLevels[id]||0));}game.enemies=[];game.shots=[];game.orbs=[];game.chests=[];game.drops=[];game.particles=[];game.slashes=[];game.texts=[];game.boss=null;game.levelChoices=null;started=true;paused=false;const ov=document.getElementById('pauseOverlay');if(ov){ov.classList.add('hidden');ov.style.display='grid';ov.style.pointerEvents='auto'}const pb=document.getElementById('pauseBtn');if(pb){pb.textContent='暂停';pb.style.display='block';pb.style.pointerEvents='auto'}if(game.wave%10===0)spawnBoss();document.getElementById('start').classList.add('hidden');last=performance.now();timeAccumulator=0;loopToken++;requestAnimationFrame(t=>loop(t,loopToken));toast(`读取存档：第 ${game.wave} 波 · Lv.${player.lv}`)}catch(e){toast('存档损坏，无法读取')}}
+let savePending=false,saveQueued=false,saveVersion=0;
+function buildSaveData(){
+  const p={...player,unlocked:{...player.unlocked},weaponLv:{...player.weaponLv},weaponKills:{...player.weaponKills},skillLevels:{...player.skillLevels}};
+  return {player:p,game:{wave:game.wave,waveTime:game.waveTime,waveDuration:game.waveDuration,kills:game.kills,score:game.score,elapsed:game.elapsed,lastSaveWave:game.lastSaveWave,completedWaves:game.completedWaves}};
+}
+function saveGame(manual=false){
+  try{
+    game.lastSaveWave=game.wave;
+    const snapshot=buildSaveData();
+    const raw=JSON.stringify(snapshot);
+    if(!storage.set('kitsune_guard_save_v15',raw))throw new Error('storage unavailable');
+    const verify=storage.get('kitsune_guard_save_v15');
+    if(!verify)throw new Error('save verification failed');
+    updateSaveLabel();
+    if(manual)toast(`已保存：第 ${game.wave} 波 · Lv.${player.lv} · 可随时读取`);
+    return true;
+  }catch(e){
+    console.warn('save failed',e);
+    if(manual)toast('存档失败：浏览器阻止了本地存储');
+    return false;
+  }
+}
+function updateSaveLabel(){const raw=storage.get('kitsune_guard_save_v15');const el=document.getElementById('saveLabel');if(!el)return;el.textContent=raw?'已有存档 · 可从上次波次继续':'暂无存档'}
+function endGame(){returnMenu()}
+function resetGame(){Object.assign(player,{x:150,y:0,r:24,hp:100,maxHp:100,lv:1,xp:0,next:130,atk:10,speed:270,energy:0,attackCd:.2,faceX:1,faceY:0,anim:0,hitFlash:0,skillAnim:0,inv:0,dodge:0,crit:.08,critDamage:1.5,magnet:105,weapon:'bow',unlocked:{bow:true},weaponLv:{bow:1,staff:1,katana:1},weaponKills:{bow:0,staff:0,katana:0},damageBonus:0,rateBonus:0,rangeBonus:0,projectileBonus:0,energyBonus:0,ultimateBonus:0,reduction:0,skillPower:1,bowPierce:0,bowBleed:false,bowScatter:0,bowMastery:0,staffPillars:5,staffFreeze:0,staffLightning:0,staffMastery:0,katanaCharge:false,katanaShield:0,katanaWeak:0,katanaMastery:0,katanaFlash:0,flameRelic:0,lightningRelic:0,iceRelic:0,dodgeRelic:0,coins:0,skillLevels:{},attackAnim:0,attackFrame:0,attackDuration:.3,katanaChargeStart:0,katanaChargeTime:0,katanaHitCount:0,katanaLastBossHit:0,bowPowerBonus:0,bowRateBonus:0,staffDamageBonus:0,staffRateBonus:0,katanaDamageBonus:0,katanaRateBonus:0,katanaBossBonus:0,shopBuys:{},lifesteal:0});Object.assign(game,{wave:1,waveTime:0,kills:0,enemies:[],shots:[],orbs:[],chests:[],drops:[],particles:[],slashes:[],texts:[],boss:null,npc:null,spawnTimer:.18,shake:0,score:0,levelChoices:null,elapsed:0,lastSaveWave:0,completedWaves:0,menu:false,shop:null});for(let i=0;i<6;i++)spawnEnemy(i%5===1?'fast':i%5===2?'tank':'normal');toast('森林生存战开始：击杀敌人，坚持更高波次')} 
+function toast(t){const el=document.getElementById('toast');el.textContent=t;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),1800)}
+function rand(a,b){return a+Math.random()*(b-a)} function clamp(v,a,b){return Math.max(a,Math.min(b,v))} function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+function addShot(s){if(game.shots.length>=180)return false;game.shots.push(s);return true}
+function addSlash(s){if(game.slashes.length>=90)return false;game.slashes.push(s);return true}
+function difficulty(){const w=game.wave;return{hp:1+.12*w+.006*w*w,damage:1+.18*(w-1)+.006*(w-1)*(w-1),speed:1+Math.min(2.2,w*.018),elite:Math.min(.48,.05+w*.006),spawn:Math.max(.12,.78-w*.009),cap:50}}
+function playerPower(){return 1+(player.lv-1)*.025+(game.wave-1)*.004}
+function randomEliteAffix(){const a=[['狂暴','速度 +55%，攻击 +35%','berserk'],['铁壁','生命 ×1.55，受到伤害 -25%','shield'],['吸血','接触玩家可回复自身生命','vampire'],['迅捷','速度 +90%，体型更小','swift'],['分裂','死亡后生成 2 个小怪','split']];return a[Math.floor(Math.random()*a.length)]}
+function spawnEnemy(type='normal',forcedElite=false){const d=difficulty();const side=Math.floor(Math.random()*4);let x,y;const gap=120;if(side===0){x=clamp(player.x-rand(520,760),MAP_MIN_X+gap,MAP_MAX_X-gap);y=clamp(player.y+rand(-520,520),MAP_MIN_Y+gap,MAP_MAX_Y-gap)}else if(side===1){x=clamp(player.x+rand(520,760),MAP_MIN_X+gap,MAP_MAX_X-gap);y=clamp(player.y+rand(-520,520),MAP_MIN_Y+gap,MAP_MAX_Y-gap)}else if(side===2){x=clamp(player.x+rand(-760,760),MAP_MIN_X+gap,MAP_MAX_X-gap);y=clamp(player.y-rand(420,620),MAP_MIN_Y+gap,MAP_MAX_Y-gap)}else{x=clamp(player.x+rand(-760,760),MAP_MIN_X+gap,MAP_MAX_X-gap);y=clamp(player.y+rand(420,620),MAP_MIN_Y+gap,MAP_MAX_Y-gap)}
+let elite=forcedElite||Math.random()<d.elite;let base=type==='tank'?110:type==='fast'?52:type==='ranged'?58:68;let hp=Number(base*d.hp*(elite?1.9:1));if(!Number.isFinite(hp)||hp<=0)hp=base;let affix=elite?randomEliteAffix():null;if(affix&&affix[2]==='shield')hp*=1.5;if(affix&&affix[2]==='swift')hp*=.9;
+const e={x,y,r:elite?28:22,hp,maxHp:hp,damage:(type==='tank'?2:type==='fast'?1.25:type==='ranged'?1.15:5)*d.damage,speed:(type==='tank'?55:type==='fast'?128:type==='ranged'?70:84)*d.speed,type,elite,spriteClass:elite?'elite':'normal',affix:affix?affix[2]:null,affixName:affix?affix[0]:'',hit:0,phase:Math.random()*TAU,shot:rand(1.1,2.7)};if(e.affix==='berserk'){e.speed*=1.55;e.damage*=1.35}if(e.affix==='swift'){e.speed*=1.9;e.r=17}if(e.affix==='vampire')e.damage*=1.05;if(game.enemies.length<difficulty().cap)game.enemies.push(e)}
+function spawnBoss(){const w=game.wave;const angle=Math.random()*TAU;const radius=Math.max(W,H)*.68;const hp=1350*(1+w*.22+.010*w*w);game.boss={x:player.x+Math.cos(angle)*radius,y:player.y+Math.sin(angle)*radius,r:68,hp,maxHp:hp,damage:26*(1+w*.075+.0025*w*w),speed:58+Math.min(110,w*1.25),attackCd:1.1,shot:1.4,skill:4.5,skill2:7,phase:0,hit:0};for(let i=0;i<55;i++)particle(game.boss.x,game.boss.y,'#ff72a8',rand(70,220));toast(`⚠ 第 ${w} 波：大 Boss 出现！它正在追击你！`)}
+
+function nearestTarget(range){let best=null,bd=range;for(const e of game.enemies){const d=dist(player,e);if(d<bd){bd=d;best=e}}if(game.boss){const d=dist(player,game.boss);if(d<bd){best=game.boss;bd=d}}return best}
+function lerpPoints(lv,pts){for(let i=1;i<pts.length;i++){if(lv<=pts[i][0]){const [x1,y1]=pts[i-1],[x2,y2]=pts[i];const t=(lv-x1)/(x2-x1);return y1+(y2-y1)*t}}return pts[pts.length-1][1]}
+function weaponStats(wid){const lv=Math.min(20,player.weaponLv[wid]||1);if(wid==='bow'){return{damage:lerpPoints(lv,[[1,40],[3,52],[5,60],[7,72],[10,88],[12,104],[15,120],[17,136],[20,152]])+(player.bowPowerBonus||0),rate:lerpPoints(lv,[[1,.85],[3,.78],[5,.75],[7,.70],[10,.65],[12,.60],[15,.55],[17,.50],[20,.45]])*(player.bowMastery?.8889:1)*(1-(player.bowRateBonus||0)),range:420*(lv>=10?1.2:1)}}if(wid==='staff'){return{damage:lerpPoints(lv,[[1,100],[3,125],[5,150],[7,175],[10,212],[12,250],[15,287],[17,325],[20,375]])+(player.staffDamageBonus||0),rate:1/lerpPoints(lv,[[1,2],[3,2.2],[5,2.4],[7,2.5],[10,2.7],[12,2.8],[15,3],[17,3.2],[20,3.5]])*(1+(player.staffRateBonus||0)),range:190}}return{damage:lerpPoints(lv,[[1,200],[3,267],[5,333],[7,427],[10,533],[12,640],[15,747],[17,867],[20,1000]])+(player.katanaDamageBonus||0),rate:lerpPoints(lv,[[1,1.2],[3,1.1],[5,1],[7,.95],[10,.85],[12,.80],[15,.75],[17,.70],[20,.65]])*(player.katanaMastery?1/1.333:1)*(1-(player.katanaRateBonus||0)),range:lerpPoints(lv,[[1,145],[5,165],[10,185],[15,220],[20,260]])}}
+function baseDamage(wid){const st=weaponStats(wid);const mastery=1+Math.min(1,(player.weaponKills[wid]||0)*.0002);let d=st.damage*mastery;if(wid==='katana')d*=.7;return d*(1+(player.damageBonus||0));}
+function markAttackFrame(wid,dur){player.attackAnim=dur;player.attackDuration=dur;player.attackFrame=0;player.skillAnim=Math.max(player.skillAnim,.08)}
+function hitTarget(t,dmg,x,y,crit=false,gainEnergy=true,opts={}){if(!t||t.hp<=0)return;const wid=player.weapon;let real=dmg;if(t!==game.boss&&wid==='bow'&&player.bowMastery)real*=1.3;if(t===game.boss&&wid==='katana')real*=1+(player.katanaBossBonus||0);if(t===game.boss&&t.electrified&&t.electrified>0)real*=1.2;if(crit)real*=player.critDamage||1.5;if(!Number.isFinite(real)||real<=0)return;t.hp=Number(t.hp);if(!Number.isFinite(t.hp))t.hp=t.maxHp||1;t.hp-=real;t.hit=.12;addText(t.x,t.y-(t.r||20)-8,crit?'暴击 '+Math.round(real):'-'+Math.round(real),crit?'#ffe58c':'#fff');burst(t.x,t.y,crit?'#fff0a0':'#dcb8ff',crit?10:4);if(gainEnergy)player.energy=Math.min(100,player.energy+1);if(wid==='bow'&&t.elite&&(player.weaponLv.bow||1)>=15&&opts.pierce){t.bleed=3;t.bleedDps=t.maxHp*.02}if(wid==='staff'&&t!==game.boss&&player.staffFreeze&&Math.random()<.10){t.freeze=1+(player.staffFreeze-1)*.2}if(player.flameRelic&&Math.random()<relicChance(.16,player.flameRelic)){t.burn=5;t.burnDps=Math.max(2,real*.10)}if(player.iceRelic&&Math.random()<relicChance(.10,player.iceRelic)){t.freeze=2}if(player.lightningRelic&&Math.random()<relicChance(.14,player.lightningRelic)){chainLightning(t,4,real*.32)}if(t.hp<=0){t.hp=0;t.hit=0}}
+function autoAttack(){if(player.attackCd>0||player.skillAnim>0||game.levelChoices)return;const wid=player.weapon,st=weaponStats(wid);if(wid==='staff'){player.attackCd=Math.max(.16,1/st.rate*(1-(player.rateBonus||0)));markAttackFrame(wid,.32);return}const range=st.range+player.rangeBonus;const t=nearestTarget(range);if(!t)return;const a=Math.atan2(t.y-player.y,t.x-player.x);player.faceX=Math.cos(a);player.faceY=Math.sin(a);player.attackCd=Math.max(.16,st.rate*(1-(player.rateBonus||0)));markAttackFrame(wid,wid==='katana'?.38:.30);if(wid==='bow'){const count=player.bowMastery?5:(player.bowScatter?3:1);for(let k=0;k<count;k++){const off=count===1?0:(k-(count-1)/2)*.07;fireProjectile(t,baseDamage('bow'),a+off,0,'arrow',weaponDefs.bow.color,false,player.bowPierce>0)}}else if(wid==='katana'){let dmg=baseDamage('katana');if(player.katanaCharge)dmg*=2;const maxHits=player.katanaMastery?99:6;let hits=0;for(const e of game.enemies){const ea=Math.atan2(e.y-player.y,e.x-player.x),da=Math.atan2(Math.sin(ea-a),Math.cos(ea-a));if(dist(player,e)<st.range+25&&Math.abs(da)<.9){hitTarget(e,dmg,e.x,e.y,Math.random()<player.crit);if(++hits>=maxHits)break}}if(game.boss&&dist(player,game.boss)<st.range+35){hitTarget(game.boss,dmg,game.boss.x,game.boss.y,Math.random()<player.crit);player.katanaLastBossHit=(player.katanaLastBossHit||0)+1;if(player.katanaWeak&&player.katanaLastBossHit>=3){player.katanaLastBossHit=0;const trueD=game.boss.maxHp-game.boss.hp;game.boss.hp=Math.max(0,game.boss.hp-trueD*.05);addText(game.boss.x,game.boss.y-85,'弱点真实伤害','#ffcc66')}}addSlash({x:player.x,y:player.y,a,life:.32,max:.32,r:st.range,boss:false,katana:true})}}
+function fireProjectile(t,dmg,a,staff=0,type='arrow',col='#fff',homing=false,pierce=false,aoe=false){const shotSpeed=560;addShot({x:player.x+Math.cos(a)*25,y:player.y+Math.sin(a)*25,vx:Math.cos(a)*shotSpeed,vy:Math.sin(a)*shotSpeed,r:6,damage:dmg,life:2.7,col,type,homing:!!homing,target:t,owner:'player',pierce:!!pierce,pierceCount:Math.max(1,player.bowPierce||0)+1,splitOnHit:false,splitDone:false,aoe:!!aoe,hitIds:new Set()});}
+function orbitAttack(dt){if(player.weapon!=='staff')return;const lv=Math.min(20,player.weaponLv.staff||1);const speed=lerpPoints(lv,[[1,2],[3,2.2],[5,2.4],[7,2.5],[10,2.7],[12,2.8],[15,3],[17,3.2],[20,3.5]]);const count=player.staffPillars||5;for(let q=0;q<count;q++){const a=game.elapsed*speed*TAU+q*TAU/count;const ox=player.x+Math.cos(a)*88,oy=player.y+Math.sin(a)*88;let n=null,bd=30;for(const e of game.enemies){const d=Math.hypot(e.x-ox,e.y-oy);if(d<bd){bd=d;n=e}}if(n&&Math.floor(game.elapsed*18)%2===q%2){let dmg=weaponStats('staff').damage;if(lv>=10)d+=0;hitTarget(n,dmg,n.x,n.y,Math.random()<player.crit);if(player.staffMastery){for(const z of game.enemies){if(z!==n&&dist(n,z)<85&&!z.elite){const za=Math.atan2(z.y-n.y,z.x-n.x);z.x+=Math.cos(za)*22;z.y+=Math.sin(za)*22}}if(n===game.boss){n.stun=Math.max(n.stun||0,.5)}}if(player.staffFreeze&&Math.random()<(lv>=10?.15:.10)){n.freeze=Math.max(n.freeze||0,1+(lv>=10?.5:0));if(player.staffLightning)chainLightning(n,player.staffLightning,dmg*.8);if(player.staffMastery&&n.hp<=0&&Math.random()<.25)game.orbs.push({x:n.x,y:n.y,type:'purify'})}if(player.staffMastery){if(n===game.boss){addSlash({x:n.x,y:n.y,a:0,life:.15,max:.15,r:75,boss:false})}if(n===game.boss)n.stun=.5}}}}
+function chainLightning(src,max,dmg){let hit=0;const seen=new Set([src]);let cur=src;while(hit<max){let next=null,bd=125;for(const e of game.enemies){if(seen.has(e))continue;const d=dist(cur,e);if(d<bd){bd=d;next=e}}if(!next)break;seen.add(next);hitTarget(next,dmg,next.x,next.y,false);if(player.staffMastery&&Math.random()<.10)next.electrified=5;addSlash({x:next.x,y:next.y,a:0,life:.18,max:.18,r:20,boss:false});cur=next;hit++}}
+function levelUp(){let changed=false;while(player.xp>=player.next){player.xp-=player.next;player.lv++;player.next=xpNeededForLevel(player.lv);const w=player.weapon;player.weaponLv[w]=Math.min(20,(player.weaponLv[w]||1)+1);changed=true}if(changed){game.levelChoices=pickChoices();toast(`升级 Lv.${player.lv}：请选择强化`)}}
+function allWeaponTalentsMaxed(){
+  return Object.keys(weaponSkills).every(wid=>{
+    const list=weaponSkills[wid]||[];
+    return list.length>0 && list.every(sk=>(player.skillLevels[sk.id]||0)>=(sk.maxLv||1));
+  });
+}
+function pickChoices(){
+  const w=player.weapon;
+  const wLv=player.weaponLv[w]||1;
+  // 只有三把武器的全部专属天赋都升满后，才允许进入人物通用天赋。
+  if(allWeaponTalentsMaxed()){
+    const charPool=[
+      {id:'char_attack_pct',name:'人物攻击强化',maxLv:999999,unlock:1,desc:'人物攻击力 +1%。',apply(){player.damageBonus=(player.damageBonus||0)+.01;toast('人物攻击力 +1%')}} ,
+      {id:'char_weapon_rate_pct',name:'武器攻速强化',maxLv:999999,unlock:1,desc:'当前武器攻击速度 +1%。',apply(){player.rateBonus=(player.rateBonus||0)+.01;toast('武器攻击速度 +1%')}} ,
+      {id:'char_hp_pct',name:'生命成长',maxLv:999999,unlock:1,desc:'最大生命值 +1%。',apply(){player.maxHp=Math.max(player.maxHp+1,Math.ceil(player.maxHp*1.01));player.hp=Math.min(player.maxHp,player.hp+Math.max(1,Math.ceil(player.maxHp*.01)));toast('最大生命值 +1%')}}
+    ];
+    return charPool;
+  }
+  // 当前武器已满时，优先从其它尚未完成的武器天赋中抽取，绝不提前变成通用天赋。
+  let pool=skillsForCurrentWeapon().slice();
+  if(wLv>=20 || pool.length===0){
+    const other=[];
+    for(const [wid,list] of Object.entries(weaponSkills)){
+      for(const sk of list){
+        const cur=player.skillLevels[sk.id]||0;
+        const max=sk.maxLv||1;
+        const lv=player.weaponLv[wid]||1;
+        if(cur<max && lv>=(sk.unlock||1) && !pool.some(x=>x.id===sk.id)) other.push(sk);
+      }
+    }
+    pool.push(...other);
+  }
+  const out=[];
+  while(out.length<3&&pool.length){const sk=pool.splice(Math.floor(Math.random()*pool.length),1)[0];if(sk)out.push(sk)}
+  return out;
+}
+function milestoneChoice(success){if(game.levelChoices!=='MILESTONE')return;if(success){game.completedWaves=game.wave;saveGame();toast(`第 ${game.wave} 波生存挑战完成！已记录里程碑，可从存档继续`);game.levelChoices=null;returnMenu()}else{game.levelChoices=null;saveGame();toast(`继续生存！从第 ${game.wave} 波继续`);}}
+function selectChoice(i){if(!Array.isArray(game.levelChoices))return;const s=game.levelChoices[i];if(!s)return toast('当前没有可选天赋');const key=s.id,max=s.maxLv||1,cur=player.skillLevels[key]||0;if(cur>=max)return toast(`${s.name} 已达到 Lv.${max}`);player.skillLevels[key]=cur+1;s.apply();game.levelChoices=null;burst(player.x,player.y,'#f0c3ff',30)}
+function dropWeapon(x,y,id){if(!id||player.unlocked[id])return;game.drops.push({x,y,id,life:999,pulse:Math.random()*TAU});toast(`武器掉落：${weaponDefs[id].name}！靠近即可拾取`)}
+function openChest(ch){if(ch.open)return;ch.open=true;const rewards=[()=>{player.maxHp+=2;player.hp=Math.min(player.maxHp,player.hp+2);return'生命上限 +2'},()=>{const gold=10;player.coins=Math.floor((player.coins||0)+gold);return`金币 +${gold}`} ];const reward=rewards[Math.floor(Math.random()*rewards.length)]();toast(`宝箱：${reward}`);for(let i=0;i<35;i++)particle(ch.x,ch.y,'#ffd66e',rand(70,260))}
+function pickupDrops(){for(let i=game.drops.length-1;i>=0;i--){const d=game.drops[i];d.life-=.016;d.pulse+=.05;if(dist(player,d)<58){player.unlocked[d.id]=true;player.weaponLv[d.id]=1;player.weapon=d.id;toast(`已获得并切换：${weaponDefs[d.id].name}`);burst(d.x,d.y,weaponDefs[d.id].color,35);game.drops.splice(i,1)}else if(d.life<=0)game.drops.splice(i,1)}}
+function hurt(n){if(player.inv>0||player.skillAnim>0)return;if(player.dodgeRelic&&Math.random()<relicChance(.08,player.dodgeRelic)){toast('闪避！');return;}n*=1-(player.reduction||0);player.hp-=n;player.inv=.48;player.hitFlash=.14;game.shake=7;burst(player.x,player.y,'#ff7188',9);if(player.hp<=0){player.hp=0;player.inv=0;player.dodge=0;player.energy=0;game.enemies.length=0;game.shots.length=0;game.orbs.length=0;game.boss=null;game.shop=null;game.levelChoices='GAMEOVER';paused=false;last=performance.now();timeAccumulator=0;toast('你倒下了……本局结束！')}}
+function addText(x,y,t,col){if(game.texts.length>=70)return;game.texts.push({x,y,t,col,life:.8,vy:-28})}function particle(x,y,col,sp){if(game.particles.length>=650)return;const a=Math.random()*TAU;game.particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:rand(.25,.8),size:rand(2,6),col})}function burst(x,y,col,n){for(let i=0;i<n;i++)particle(x,y,col,rand(45,230))}
+
+const shopDefs={
+ sharpen:{name:'磨刀石',base:100,desc:'全武器攻击力 +5%',apply(){player.damageBonus=(player.damageBonus||0)+.05}},
+ armor:{name:'轻甲涂层',base:100,desc:'受伤减少 3%，减伤上限80%',apply(){player.reduction=Math.min(.8,(player.reduction||0)+.03)}},
+ seed:{name:'生命种子',base:120,desc:'最大生命值 +8%',apply(){const old=player.maxHp;player.maxHp=Math.ceil(player.maxHp*1.08);player.hp+=player.maxHp-old}},
+ gear:{name:'攻速齿轮',base:150,desc:'全武器攻速 +4%',apply(){player.rateBonus=Math.min(.85,(player.rateBonus||0)+.04)}},
+ exp:{name:'经验护符',base:200,desc:'经验获取 +8%',apply(){player.xpBonus=(player.xpBonus||0)+.08}},
+ gold:{name:'金币磁铁',base:200,desc:'金币获取 +10%',apply(){player.lootBonus=(player.lootBonus||0)+.10}},
+ crit:{name:'暴击之瞳',base:250,desc:'暴击率 +3%，暴击伤害 +10%',apply(){player.crit=Math.min(.80,(player.crit||0)+.03);player.critDamage=(player.critDamage||1.5)+.10}},
+ speed:{name:'移速之羽',base:80,desc:'移速 +3%，最高额外+100%',apply(){player.shopSpeedBonus=Math.min(1,(player.shopSpeedBonus||0)+.03);player.speed=270*(1+(player.shopSpeedBonus||0))}},
+ lifesteal:{name:'吸血之牙',base:300,desc:'攻击伤害的1%转化为回血，上限30%',apply(){player.lifesteal=Math.min(.30,(player.lifesteal||0)+.01)}},
+ pierce:{name:'穿透之核',base:350,desc:'弓箭穿透层数 +1',apply(){player.bowPierce=Math.min(20,(player.bowPierce||0)+1)}},
+ ice:{name:'冰柱碎片',base:350,desc:'法杖冰柱数量 +1',apply(){player.staffPillars=Math.min(7,(player.staffPillars||5)+1)}},
+ blade:{name:'刀意残页',base:400,desc:'太刀破盾值 +10%',apply(){player.katanaShield=(player.katanaShield||0)+.10}}
+};
+function shopPrice(id){const n=player.shopBuys?.[id]||0;return Math.ceil(shopDefs[id].base*Math.pow(1.3,n))}
+function spawnShop(){const margin=260;const maxR=Math.min(Math.abs(MAP_MAX_X-margin),Math.abs(MAP_MAX_Y-margin));const r=Math.min(260,maxR*.72);const a=Math.random()*TAU;game.shop={x:clamp(arena.x+Math.cos(a)*r,MAP_MIN_X+margin,MAP_MAX_X-margin),y:clamp(arena.y+Math.sin(a)*r,MAP_MIN_Y+margin,MAP_MAX_Y-margin),life:15,offers:[],refreshes:0};refreshShop();toast('🦝 流浪浣熊来到森林！停留15秒，靠近按 F 打开商店')}
+function refreshShop(){if(!game.shop)return;game.shop.offers=Object.keys(shopDefs).sort(()=>Math.random()-.5).slice(0,4)}
+function buyShop(id){if(!game.shop||!shopDefs[id])return;const price=shopPrice(id);if(player.coins<price)return toast('金币不足');player.coins-=price;shopDefs[id].apply();player.shopBuys[id]=(player.shopBuys[id]||0)+1;toast(`购买 ${shopDefs[id].name} · ${price}金币`)}
+function interactShop(){if(!game.shop)return;if(dist(player,game.shop)>85)return toast('靠近流浪浣熊才能购物');game.shopBusy=true;const list=game.shop.offers.map((id,i)=>`${i+1}. ${shopDefs[id].name}｜${shopPrice(id)}金币
+   ${shopDefs[id].desc}`).join('\n');const n=prompt(`🦝 流浪浣熊商店（剩余 ${Math.ceil(game.shop.life)} 秒）\n\n${list}\n\n输入 1-4 购买；输入 R 刷新（费用=当前波次×5金币）`);game.shopBusy=false;if(!n)return;if(n.toLowerCase()==='r'){const cost=game.wave*5;if(player.coins<cost)return toast('金币不足，无法刷新');player.coins-=cost;game.shop.refreshes++;refreshShop();toast(`商店已刷新，花费 ${cost} 金币`);return}const i=Number(n)-1;if(i>=0&&i<game.shop.offers.length)buyShop(game.shop.offers[i])}
+function updateShop(dt){if(!game.shop)return;game.shop.life-=dt;if(game.shop.life<=0){game.shop=null;toast('🦝 流浪浣熊离开了森林')}}
+function drawShop(){if(!game.shop)return;ctx.save();ctx.translate(game.shop.x,game.shop.y);ctx.fillStyle='#4a2b18';ctx.beginPath();ctx.arc(0,0,25,0,TAU);ctx.fill();ctx.fillStyle='#d7a56b';ctx.beginPath();ctx.arc(0,-7,18,0,TAU);ctx.fill();ctx.fillStyle='#111';ctx.fillRect(-9,-9,6,5);ctx.fillRect(3,-9,6,5);ctx.fillStyle='#fff';ctx.font='bold 12px system-ui';ctx.textAlign='center';ctx.fillText('浣熊商店',0,-38);ctx.fillStyle='#ffd66d';ctx.fillText(`F 购物 · ${Math.ceil(game.shop.life)}s`,0,45);ctx.restore()}
+
+function defeatEnemy(e){
+  if(!e||e._defeated)return false;
+  e._defeated=true;
+  game.kills++;game.score+=e.elite?40:10;
+  const xpBase=e.elite?Math.floor((8+1.5*game.wave)*5):Math.floor(8+1.5*game.wave);player.xp+=xpBase*(1+(player.xpBonus||0));
+  player.weaponKills[player.weapon]=(player.weaponKills[player.weapon]||0)+1;
+  const goldBase=e.elite?Math.round((3+.5*game.wave)*5):Math.round(3+.5*game.wave);player.coins=Math.floor(player.coins+goldBase*(1+(player.lootBonus||0)));
+  if(Math.random()<.12)game.orbs.push({x:e.x,y:e.y,type:'heal'});
+  
+  if(e.elite||Math.random()<.012)game.chests.push({x:e.x,y:e.y,open:false,life:8});
+  
+  if(e.affix==='split'){spawnEnemy('fast');spawnEnemy('fast')}
+  
+  for(let k=0;k<10;k++)particle(e.x,e.y,e.elite?'#ffbd70':'#72cfff',rand(40,160));
+  return true;
+}
+
+function cleanupDeadEnemies(){for(let i=game.enemies.length-1;i>=0;i--){const e=game.enemies[i];if(!e||!Number.isFinite(e.hp)||e.hp<=0){if(e){e.hp=0;defeatEnemy(e)}game.enemies.splice(i,1);levelUp()}}}
+
+function update(dt){if(!started)return;if(game.shopBusy)return;if(game.levelChoices==='MILESTONE'){for(let i=game.particles.length-1;i>=0;i--){const p=game.particles[i];p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=.97;p.vy*=.97;p.life-=dt;if(p.life<=0)game.particles.splice(i,1)}return}
+if(game.levelChoices){return}
+game.elapsed+=dt;updateShop(dt);player.inv=Math.max(0,player.inv-dt);player.hitFlash=Math.max(0,player.hitFlash-dt);player.attackCd=Math.max(0,player.attackCd-dt);player.dodge=Math.max(0,player.dodge-dt);player.skillAnim=Math.max(0,player.skillAnim-dt);player.attackAnim=Math.max(0,(player.attackAnim||0)-dt);
+let dx=(keys.KeyD?1:0)-(keys.KeyA?1:0),dy=(keys.KeyS?1:0)-(keys.KeyW?1:0);if(dx||dy){const l=Math.hypot(dx,dy);dx/=l;dy/=l;player.faceX=dx;player.faceY=dy;const boost=player.dodge>0?1.6:1;player.x=clamp(player.x+dx*player.speed*dt*boost,MAP_MIN_X+player.r,MAP_MAX_X-player.r);player.y=clamp(player.y+dy*player.speed*dt*boost,MAP_MIN_Y+player.r,MAP_MAX_Y-player.r);player.anim+=dt*8}else player.anim+=dt*2;
+// 商店附近设置安全圈：怪物不会把玩家逼进边界；若玩家已经贴边且有近身怪，轻推回地图内部。
+if(game.shop&&dist(player,game.shop)<125){for(const e of game.enemies){const d=dist(player,e);if(d<125){const q=Math.max(.001,d);e.x+=((e.x-player.x)/q)*(125-d)*dt*7;e.y+=((e.y-player.y)/q)*(125-d)*dt*7;}}}
+const edge=10;let nearEdge=false;if(player.x<=MAP_MIN_X+player.r+edge){player.x=MAP_MIN_X+player.r+edge;nearEdge=true}if(player.x>=MAP_MAX_X-player.r-edge){player.x=MAP_MAX_X-player.r-edge;nearEdge=true}if(player.y<=MAP_MIN_Y+player.r+edge){player.y=MAP_MIN_Y+player.r+edge;nearEdge=true}if(player.y>=MAP_MAX_Y-player.r-edge){player.y=MAP_MAX_Y-player.r-edge;nearEdge=true}if(nearEdge){for(const e of game.enemies){if(dist(player,e)<player.r+e.r+18){const q=Math.max(.001,dist(player,e));player.x=clamp(player.x-(e.x-player.x)/q*6,MAP_MIN_X+player.r+edge,MAP_MAX_X-player.r-edge);player.y=clamp(player.y-(e.y-player.y)/q*6,MAP_MIN_Y+player.r+edge,MAP_MAX_Y-player.r-edge);}}}
+if(keys.Space&&player.dodge<=0){player.dodge=.22;player.inv=.38;const l=Math.hypot(player.faceX,player.faceY)||1;player.x=clamp(player.x+player.faceX/l*52,MAP_MIN_X+player.r,MAP_MAX_X-player.r);player.y=clamp(player.y+player.faceY/l*52,MAP_MIN_Y+player.r,MAP_MAX_Y-player.r)}
+if(player.ascCharge>0){updateAscensionCharge(dt)}else autoAttack();orbitAttack(dt);
+const d=difficulty();game.spawnTimer-=dt;/* 怪物池固定100：只有死亡/移除造成空位后才补怪，不会无限叠加。 */if(game.spawnTimer<=0&&game.enemies.length<d.cap){const missing=Math.min(4,d.cap-game.enemies.length);for(let m=0;m<missing;m++){const roll=Math.random();spawnEnemy(roll<.14?'fast':roll<.24?'tank':roll<.34?'ranged':'normal',false)}game.spawnTimer=d.spawn*(.68+Math.random()*.32)}
+game.waveTime+=dt;if(game.waveTime>=game.waveDuration){const completedWave=game.wave;game.wave++;game.waveTime=0;const waveGold=5+2*completedWave;player.coins=Math.floor(player.coins+waveGold*(1+(player.lootBonus||0)));if(window.FarmSystem)window.FarmSystem.add(5+completedWave*2);toast(`第 ${game.wave} 波：森林污染加剧 · 第${completedWave}波结算 +${Math.floor(waveGold*(1+(player.lootBonus||0)))}金币`);if(completedWave%5===0)spawnShop();if(game.wave===8&&!player.unlocked.staff)dropWeapon(player.x+90,player.y,'staff');if(game.wave===16&&!player.unlocked.katana)dropWeapon(player.x+90,player.y,'katana');if(game.wave%10===0){spawnBoss();toast(`第 ${game.wave} 波：大 Boss 来袭！`)}if(completedWave===50){game.completedWaves=50;saveGame();game.levelChoices='MILESTONE';toast('🎉 50 波通关！已自动保存一次，可继续挑战更高波次');}}
+for(let i=game.enemies.length-1;i>=0;i--){const e=game.enemies[i];if(!e||!Number.isFinite(e.hp)||e.hp<=0)continue;e.hit=Math.max(0,e.hit-dt);e.phase+=dt*3;e.burn=Math.max(0,(e.burn||0)-dt);e.bleed=Math.max(0,(e.bleed||0)-dt);e.freeze=Math.max(0,(e.freeze||0)-dt);if(e.burn>0)e.hp-=e.burnDps*dt;if(e.bleed>0)e.hp-=e.bleedDps*dt;e.electrified=Math.max(0,(e.electrified||0)-dt);e.stun=Math.max(0,(e.stun||0)-dt);const a=Math.atan2(player.y-e.y,player.x-e.x);if(e.freeze<=0){e.x+=Math.cos(a)*e.speed*dt;e.y+=Math.sin(a)*e.speed*dt;}if(e.type==='ranged'){e.shot-=dt;if(e.shot<=0){e.shot=2.2;const aa=Math.atan2(player.y-e.y,player.x-e.x);addShot({x:e.x,y:e.y,vx:Math.cos(aa)*190,vy:Math.sin(aa)*190,r:7,damage:e.damage*.55,life:4,col:'#c77bff',type:'enemy'})}}e.contactCd=Math.max(0,(e.contactCd||0)-dt);if(dist(player,e)<player.r+e.r){if(e.contactCd<=0){hurt(e.damage);e.contactCd=.58;burst(player.x,player.y,'#ff5d72',7)}e.x=clamp(e.x-Math.cos(a)*10,MAP_MIN_X+e.r,MAP_MAX_X-e.r);e.y=clamp(e.y-Math.sin(a)*10,MAP_MIN_Y+e.r,MAP_MAX_Y-e.r)}
+}
+if(game.boss){const b=game.boss;b.hit=Math.max(0,b.hit-dt);const a=Math.atan2(player.y-b.y,player.x-b.x);const dp=dist(b,player);b.shot-=dt;b.skill-=dt;b.skill2-=dt;if(dp>125){b.x+=Math.cos(a)*b.speed*dt;b.y+=Math.sin(a)*b.speed*dt}else{b.attackCd-=dt;if(b.attackCd<=0){b.attackCd=b.phase?.82:1.12;hurt(b.damage);addSlash({x:player.x,y:player.y,a:0,life:.35,max:.35,r:85,boss:true});toast('Boss 近身攻击！')}}
+if(dp<150){b.contactCd=Math.max(0,(b.contactCd||0)-dt);if(b.contactCd<=0){hurt(b.damage);b.contactCd=.72;if(started&&game.boss===b)burst(player.x,player.y,'#ff5d72',12);else { game.boss=null; }}}
+/* 玩家被 Boss 命中后可能触发倒下/重置；不要继续操作已经失效的 Boss 引用。 */
+if(!started||game.boss!==b) { /* 本帧后续 Boss 技能全部跳过 */ } else if(b.shot<=0){b.shot=b.phase?.65:1.15;const base=Math.atan2(player.y-b.y,player.x-b.x);const n=b.phase?9:6;for(let k=0;k<n;k++){const aa=base+(k-(n-1)/2)*.17;addShot({x:b.x,y:b.y,vx:Math.cos(aa)*(b.phase?290:225),vy:Math.sin(aa)*(b.phase?290:225),r:8,damage:b.damage*.34,life:4,col:'#ff6d9e',type:'enemy'})}}
+if(game.boss===b&&b.skill<=0){b.skill=b.phase?3.8:5.5;addSlash({x:b.x,y:b.y,a:0,life:.5,max:.5,r:b.phase?250:190,boss:true});toast(b.phase?'Boss：月蚀爆环！':'Boss：月蚀冲击波！');for(let k=0;k<(b.phase?14:9);k++){const aa=k*TAU/(b.phase?14:9);addShot({x:b.x,y:b.y,vx:Math.cos(aa)*240,vy:Math.sin(aa)*240,r:9,damage:b.damage*.46,life:3.3,col:'#ffcf72',type:'enemy'})}}
+if(game.boss===b&&b.skill2<=0){b.skill2=b.phase?6:8.5;for(let k=0;k<(b.phase?5:3);k++)spawnEnemy(k%2?'fast':'normal',true);toast('Boss：召唤精英爪牙！')}
+if(game.boss===b&&b.hp<b.maxHp*.5&&b.phase===0){b.phase=1;b.speed*=1.45;toast('👑 Boss 暴走第二阶段！');for(let i=0;i<45;i++)particle(b.x,b.y,'#ff5f9b',rand(80,300))}if(game.boss===b&&b.hp<=0){const bx=b.x,by=b.y;game.boss=null;game.kills+=45;const bossXp=Math.floor(100+15*game.wave+0.8*game.wave*game.wave);player.xp+=bossXp*(1+(player.xpBonus||0));player.coins=Math.floor(player.coins+(100+20*game.wave+game.wave*game.wave)*(1+(player.lootBonus||0)));game.chests.push({x:bx,y:by,open:false,life:8});for(let i=0;i<100;i++)particle(bx,by,'#ff9fce',rand(90,380));toast('👑 大 Boss 击破！王之宝箱');levelUp()}}
+for(let i=game.shots.length-1;i>=0;i--){const s=game.shots[i];if(s.homing&&s.target&&s.target.hp>0){const a=Math.atan2(s.target.y-s.y,s.target.x-s.x);const sp=Math.hypot(s.vx,s.vy);s.vx+=(Math.cos(a)*sp-s.vx)*dt*4;s.vy+=(Math.sin(a)*sp-s.vy)*dt*4}s.x+=s.vx*dt;s.y+=s.vy*dt;s.life-=dt;if(s.owner==='player'){let hit=false;for(const e of game.enemies){if(!s.hitIds.has(e)&&dist(s,e)<s.r+e.r){s.hitIds.add(e);const crit=Math.random()<player.crit;hitTarget(e,s.damage,s.x,s.y,crit,true,{pierce:!!s.pierce});hit=true;if(s.splitOnHit&&!s.splitDone){s.splitDone=true;spawnSpreadBurst(s.x,s.y,Math.atan2(s.vy,s.vx),s.damage)}if(s.pierce && s.hitIds.size>=s.pierceCount)s.life=0;else if(!s.pierce)s.life=0}}if(!hit&&game.boss&&!s.hitIds.has(game.boss)&&dist(s,game.boss)<s.r+game.boss.r){s.hitIds.add(game.boss);hitTarget(game.boss,s.damage*1.1*(s.type==='bolt'||s.type==='boltSplit'?1+(player.staffBossBonus||0):1),s.x,s.y,Math.random()<player.crit);hit=true;if(!s.pierce)s.life=0}}else if(dist(player,s)<player.r+s.r){hurt(s.damage);s.life=0}if(s.life<=0)game.shots.splice(i,1)}
+// 投射物/狐火可能在怪物更新阶段之后击杀敌人；本帧立即清理，避免0血精英残留成‘无敌怪’。
+cleanupDeadEnemies();
+for(let i=game.orbs.length-1;i>=0;i--){const o=game.orbs[i];if(dist(player,o)<player.magnet){o.x+=(player.x-o.x)*dt*4.5;o.y+=(player.y-o.y)*dt*4.5}if(dist(player,o)<28){if(o.type==='heal'||o.type==='purify')player.hp=Math.min(player.maxHp,player.hp+30);else {player.coins=Math.floor(player.coins+3)}burst(o.x,o.y,o.type==='heal'||o.type==='purify'?'#79f0b0':'#ffd66e',10);game.orbs.splice(i,1)}}
+// 人物小范围自动吸取宝箱：进入 140px 范围后开始向玩家移动，近距离自动拾取
+for(const ch of game.chests){
+  if(ch.open)continue;
+  ch.life=(Number(ch.life)||5)-dt;
+  if(ch.life<=0){ch.open=true;continue;}
+  const cd=dist(player,ch);
+  if(cd<140){
+    if(cd>34){
+      const q=Math.max(.001,cd);
+      const pull=Math.min(420,150+((140-cd)/106)*320);
+      ch.x+=(player.x-ch.x)/q*pull*dt;
+      ch.y+=(player.y-ch.y)/q*pull*dt;
+    }
+    if(dist(player,ch)<38)openChest(ch);
+  }
+}
+game.chests=game.chests.filter(ch=>!ch.open);
+pickupDrops();for(let i=game.slashes.length-1;i>=0;i--){game.slashes[i].life-=dt;if(game.slashes[i].life<=0)game.slashes.splice(i,1)}for(let i=game.particles.length-1;i>=0;i--){const p=game.particles[i];p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=.97;p.vy*=.97;p.life-=dt;if(p.life<=0)game.particles.splice(i,1)}for(let i=game.texts.length-1;i>=0;i--){const t=game.texts[i];t.y+=t.vy*dt;t.life-=dt;if(t.life<=0)game.texts.splice(i,1)}}
+
+function hash(x,y){let n=(Math.imul(x|0,374761393)^Math.imul(y|0,668265263))>>>0;n=(n^(n>>>13));n=Math.imul(n,1274126177)>>>0;return n}
+function drawForest(x0,y0,x1,y1){const step=90;for(let x=Math.floor(x0/step)*step;x<x1;x+=step)for(let y=Math.floor(y0/step)*step;y<y1;y+=step){const h=hash(Math.floor(x/step),Math.floor(y/step));const r=(h%1000)/1000;const sway=((h>>5)%7)-3;if(r<.40){ctx.fillStyle='#102a25';ctx.beginPath();ctx.arc(x+28,y+31,25,0,TAU);ctx.arc(x+5,y+43,19,0,TAU);ctx.arc(x+52,y+43,21,0,TAU);ctx.fill();ctx.fillStyle='#1b4235';ctx.beginPath();ctx.arc(x+29+sway,y+18,19,0,TAU);ctx.fill();ctx.fillStyle='#254f3d';ctx.beginPath();ctx.arc(x+16+sway,y+28,12,0,TAU);ctx.arc(x+43+sway,y+30,14,0,TAU);ctx.fill();ctx.fillStyle='#3b2a21';ctx.fillRect(x+25,y+44,7,29)}else if(r<.49){ctx.fillStyle='#263f43';ctx.beginPath();ctx.ellipse(x+30,y+40,29,17,0,0,TAU);ctx.fill();ctx.fillStyle='#3e675e';ctx.beginPath();ctx.ellipse(x+20,y+34,14,8,0,0,TAU);ctx.ellipse(x+40,y+38,12,7,0,0,TAU);ctx.fill()}else if(r<.54){ctx.fillStyle='#213d34';ctx.fillRect(x+10,y+20,42,28);ctx.fillStyle='#d6b66a';ctx.fillRect(x+24,y+26,14,15)}else if(r<.62){ctx.strokeStyle='#49655b';ctx.lineWidth=4;ctx.beginPath();ctx.arc(x+30,y+32,22,0,TAU);ctx.stroke();ctx.fillStyle='#77937f';ctx.fillRect(x+27,y+9,6,45)}}
+}
+function drawMenuForest(){ctx.clearRect(0,0,W,H);const g=ctx.createLinearGradient(0,0,0,H);g.addColorStop(0,'#081b1a');g.addColorStop(.48,'#12372c');g.addColorStop(1,'#06100d');ctx.fillStyle=g;ctx.fillRect(0,0,W,H);ctx.save();
+// 月光
+ctx.globalAlpha=.18;ctx.fillStyle='#d9f4df';ctx.beginPath();ctx.arc(W*.78,H*.22,105,0,TAU);ctx.fill();ctx.globalAlpha=.08;ctx.beginPath();ctx.arc(W*.78,H*.22,165,0,TAU);ctx.fill();ctx.globalAlpha=1;
+// 远景林线
+for(let i=0;i<18;i++){const x=i*92-30;const h=130+(hash(i,9)%90);ctx.fillStyle=i%2?'#0b2520':'#0d2c25';ctx.beginPath();ctx.moveTo(x,H*.58);ctx.lineTo(x+55,H*.58-h);ctx.lineTo(x+110,H*.58);ctx.closePath();ctx.fill()}
+// 森林地面
+ctx.fillStyle='#163b2e';ctx.fillRect(0,H*.48,W,H*.52);ctx.globalAlpha=.22;ctx.fillStyle='#8fbf91';for(let i=0;i<85;i++){const x=(hash(i,17)%1000)/1000*W,y=H*.50+(hash(i,31)%1000)/1000*H*.42;ctx.fillRect(x,y,2,5)}ctx.globalAlpha=1;
+// 林间小路
+ctx.fillStyle='#355443';ctx.beginPath();ctx.moveTo(W*.43,H);ctx.quadraticCurveTo(W*.47,H*.72,W*.50,H*.53);ctx.quadraticCurveTo(W*.53,H*.72,W*.59,H);ctx.closePath();ctx.fill();
+// 前景树影
+for(let i=0;i<10;i++){const x=i*175-70;ctx.fillStyle='#061713';ctx.fillRect(x,H*.47,28,H*.53);ctx.beginPath();ctx.arc(x+14,H*.42,72,0,TAU);ctx.fill();ctx.beginPath();ctx.arc(x-28,H*.48,55,0,TAU);ctx.arc(x+55,H*.49,60,0,TAU);ctx.fill()}
+ctx.restore();
+}
+
+function drawPlayer(){ctx.save();ctx.translate(player.x,player.y);ctx.globalAlpha=player.inv>0&&Math.floor(player.inv*18)%2?.28:1;const moving=!!(keys.KeyW||keys.KeyA||keys.KeyS||keys.KeyD);const ai=Number.isFinite(player.anim)?Math.floor(player.anim):0;const ei=Number.isFinite(game.elapsed)?Math.floor(game.elapsed*4):0;let frame=imgs[moving?6+((ai%6+6)%6):((ei%6+6)%6)];if(player.attackAnim>0){const arr=weaponImgs[player.weapon]||[];const idx=Math.min(arr.length-1,Math.floor((1-player.attackAnim/player.attackDuration)*arr.length));if(arr[idx]?.complete&&arr[idx].naturalWidth>0)frame=arr[idx]}if(frame&&frame.complete&&frame.naturalWidth>0){const flip=player.faceX<0;ctx.save();ctx.scale(flip?-1:1,1);let scale=frame===imgs[0]?.30:.38;if(player.attackAnim>0)scale=.42;const w=frame.width*scale,h=frame.height*scale;ctx.drawImage(frame,-w/2,-h*.68,w,h);ctx.restore()}else{ctx.fillStyle='#f5eaff';ctx.beginPath();ctx.arc(0,-18,18,0,TAU);ctx.fill()}ctx.globalAlpha=1;if(player.weapon==='staff'){const cnt=player.staffPillars||5;for(let q=0;q<cnt;q++){const a=game.elapsed*weaponStats('staff').rate*TAU+q*TAU/cnt;ctx.save();ctx.translate(Math.cos(a)*88,Math.sin(a)*88);ctx.rotate(a+Math.PI/2);if(staffSnowflakeImg.complete&&staffSnowflakeImg.naturalWidth>0){const pulse=1+Math.sin(game.elapsed*7+q)*.06;const size=66*pulse;ctx.globalAlpha=.94;ctx.shadowColor='#bdeaff';ctx.shadowBlur=16;ctx.drawImage(staffSnowflakeImg,-size/2,-size/2,size,size)}else{ctx.fillStyle='#9f8cff';ctx.shadowColor='#8c7dff';ctx.shadowBlur=12;ctx.fillRect(-4,-18,8,36);ctx.fillStyle='#e8e0ff';ctx.fillRect(-2,-12,4,20)}ctx.restore()}}if(player.projectileBonus>0){for(let q=0;q<player.projectileBonus;q++){const aFire=game.elapsed*(1.8+q*.08)+q*TAU/player.projectileBonus;const rr=58+Math.min(18,player.projectileBonus*2),ox=Math.cos(aFire)*rr,oy=Math.sin(aFire)*rr;ctx.save();ctx.translate(ox,oy);ctx.globalAlpha=.92;ctx.fillStyle='#ff9b42';ctx.shadowColor='#ff6b2f';ctx.shadowBlur=12;ctx.beginPath();ctx.arc(0,0,7+Math.sin(game.elapsed*10+q)*1.5,0,TAU);ctx.fill();ctx.restore()}}ctx.restore();bar(player.x,player.y+42,player.hp/player.maxHp,'#6be59d',62)}
+function drawEnemy(e){ctx.save();ctx.translate(e.x,e.y);if(e.hit>0)ctx.globalAlpha=.5;const bob=Math.sin(e.phase)*1.5;ctx.translate(0,bob);
+const img=e.elite?eliteEnemyImg:normalEnemyImg;
+if(img.complete&&img.naturalWidth>0){
+  ctx.save();ctx.imageSmoothingEnabled=false;
+  const scale=e.elite?0.62:(e.type==='fast'?.72:e.type==='tank'?.92:e.type==='ranged'?.78:.82);
+  const w=img.width*scale,h=img.height*scale;
+  ctx.shadowBlur=e.elite?14:7;
+  ctx.shadowColor=e.elite?(e.affix==='berserk'?'#ff6565':e.affix==='shield'?'#77baff':e.affix==='vampire'?'#c46bff':e.affix==='swift'?'#7affc0':'#ffd16d'):'#71e5a0';
+  ctx.drawImage(img,-w/2,-h*.72,w,h);ctx.shadowBlur=0;ctx.restore();
+}else{ctx.fillStyle=e.elite?'#79b84b':'#4fc878';ctx.beginPath();ctx.arc(0,0,e.r,0,TAU);ctx.fill()}
+if(e.type==='tank'){ctx.strokeStyle='#a9caec';ctx.lineWidth=3;ctx.beginPath();ctx.arc(0,0,e.r+4,0,TAU);ctx.stroke()}
+if(e.type==='ranged'){ctx.strokeStyle='#d8a8ff';ctx.lineWidth=3;ctx.beginPath();ctx.arc(0,0,e.r+6,0,TAU);ctx.stroke()}
+if(e.elite){ctx.strokeStyle=e.affix==='berserk'?'#ff6565':e.affix==='shield'?'#77baff':e.affix==='vampire'?'#c46bff':e.affix==='swift'?'#7affc0':'#ffd16d';ctx.lineWidth=4;ctx.beginPath();ctx.arc(0,0,e.r+9,0,TAU);ctx.stroke();ctx.fillStyle='#fff';ctx.font='bold 11px system-ui';ctx.textAlign='center';ctx.fillText('精英 · '+e.affixName,0,-e.r-17)}ctx.restore();bar(e.x,e.y-e.r-11,e.hp/e.maxHp,e.elite?'#ffbd70':'#70e5a0',e.elite?58:50)}
+function drawBoss(b){ctx.save();ctx.translate(b.x,b.y);
+if(bossEnemyImg.complete&&bossEnemyImg.naturalWidth>0){
+  ctx.save();ctx.imageSmoothingEnabled=false;const scale=b.phase?0.72:0.66;const w=bossEnemyImg.width*scale,h=bossEnemyImg.height*scale;ctx.shadowBlur=b.phase?28:18;ctx.shadowColor=b.phase?'#ff4f9c':'#d8b36a';ctx.drawImage(bossEnemyImg,-w/2,-h*.72,w,h);ctx.restore();
+}else{ctx.fillStyle=b.phase?'#a33f78':'#6547a6';ctx.beginPath();ctx.arc(0,0,70,0,TAU);ctx.fill()}
+ctx.strokeStyle=b.phase?'#ff5d9e':'#d6a0ff';ctx.lineWidth=7;ctx.beginPath();ctx.arc(0,0,88,0,TAU);ctx.stroke();ctx.fillStyle='#fff';ctx.font='bold 13px system-ui';ctx.textAlign='center';ctx.fillText('BOSS · 月影古树',0,112);ctx.restore();bar(b.x,b.y-122,b.hp/b.maxHp,'#ff718d',160)}
+function drawShot(s){if(s.type==='arrow'&&arrowImg.complete&&arrowImg.naturalWidth>0){ctx.save();ctx.translate(s.x,s.y);ctx.rotate(Math.atan2(s.vy,s.vx));const len=Math.max(48,Math.min(72,Math.hypot(s.vx,s.vy)*.105));const h=len*(arrowImg.height/arrowImg.width);ctx.shadowBlur=12;ctx.shadowColor='#66cfff';ctx.drawImage(arrowImg,-len/2,-h/2,len,h);ctx.shadowBlur=0;ctx.restore();return}ctx.fillStyle=s.col||'#ff78a7';ctx.shadowBlur=10;ctx.shadowColor=ctx.fillStyle;ctx.beginPath();ctx.arc(s.x,s.y,s.r,0,TAU);ctx.fill();ctx.shadowBlur=0}
+function drawOrb(o){ctx.save();ctx.translate(o.x,o.y);ctx.fillStyle=o.type==='heal'||o.type==='purify'?'#70edab':'#71e8ff';ctx.shadowBlur=18;ctx.shadowColor=ctx.fillStyle;ctx.beginPath();ctx.arc(0,0,8+Math.sin(game.elapsed*5)*2,0,TAU);ctx.fill();ctx.restore()}
+function drawNpc(){if(!game.npc)return;ctx.save();ctx.translate(game.npc.x,game.npc.y);ctx.fillStyle='#2b1c45';ctx.beginPath();ctx.arc(0,0,24,0,TAU);ctx.fill();ctx.strokeStyle='#e7c46a';ctx.lineWidth=4;ctx.stroke();ctx.fillStyle='#fff';ctx.font='bold 11px system-ui';ctx.textAlign='center';ctx.fillText('商人',0,-34);ctx.fillStyle='#ffd66d';ctx.fillText('F 购买圣物',0,43);ctx.restore()}
+function drawChest(ch){ctx.save();ctx.translate(ch.x,ch.y);ctx.fillStyle='#9c6331';ctx.fillRect(-24,-17,48,34);ctx.fillStyle='#e9c76b';ctx.fillRect(-5,-17,10,34);ctx.strokeStyle='#ffd97a';ctx.lineWidth=3;ctx.strokeRect(-24,-17,48,34);ctx.fillStyle='#fff0a5';ctx.font='bold 10px system-ui';ctx.textAlign='center';ctx.fillText('宝箱',0,-27);ctx.restore()}
+function drawDrop(d){const wd=weaponDefs[d.id];ctx.save();ctx.translate(d.x,d.y);const p=1+Math.sin(d.pulse)*.08;ctx.scale(p,p);ctx.fillStyle='#080c18';ctx.beginPath();ctx.arc(0,0,26,0,TAU);ctx.fill();ctx.strokeStyle=wd.color;ctx.lineWidth=4;ctx.stroke();ctx.strokeStyle=wd.color;ctx.lineWidth=5;ctx.beginPath();ctx.moveTo(-12,9);ctx.lineTo(14,-12);ctx.stroke();ctx.fillStyle='#fff';ctx.font='bold 11px system-ui';ctx.textAlign='center';ctx.fillText(wd.short,0,40);ctx.restore()}
+function drawSlash(s){ctx.save();ctx.translate(s.x,s.y);ctx.rotate(s.a||0);ctx.globalAlpha=Math.max(0,s.life/s.max);ctx.strokeStyle=s.ultimate?'#e9b8ff':s.boss?'#ffcf72':s.katana?'#ff8fc1':'#e7b2ff';ctx.lineWidth=s.ultimate?12:s.boss?10:8;ctx.beginPath();ctx.arc(0,0,s.r,-1.05,1.05);ctx.stroke();if(s.ultimate){ctx.lineWidth=3;ctx.beginPath();ctx.arc(0,0,s.r*.72,0,TAU);ctx.stroke()}ctx.restore()}
+function bar(x,y,p,col,w=60){ctx.fillStyle='#101522';ctx.fillRect(x-w/2,y,w,5);ctx.fillStyle=col;ctx.fillRect(x-w/2,y,w*clamp(p,0,1),5)}
+function draw(){ctx.clearRect(0,0,W,H);ctx.fillStyle='#0b1a18';ctx.fillRect(0,0,W,H);const camX=clamp(player.x,MAP_MIN_X+W/2,MAP_MAX_X-W/2),camY=clamp(player.y,MAP_MIN_Y+H/2,MAP_MAX_Y-H/2);const sx=W/2-camX,sy=H/2-camY;ctx.save();if(game.shake>0){ctx.translate(rand(-game.shake,game.shake),rand(-game.shake,game.shake));game.shake=Math.max(0,game.shake-.75)}ctx.translate(sx,sy);const minX=MAP_MIN_X,minY=MAP_MIN_Y,maxX=MAP_MAX_X,maxY=MAP_MAX_Y;
+if(battleBgImg.complete&&battleBgImg.naturalWidth>0){
+  ctx.imageSmoothingEnabled=false;
+  ctx.drawImage(battleBgImg,MAP_MIN_X,MAP_MIN_Y,MAP_W,MAP_H);
+}else{
+  ctx.fillStyle='#39753f';ctx.fillRect(minX,minY,MAP_W,MAP_H);
+  ctx.fillStyle='#2e6335';
+  for(let gx=minX;gx<maxX;gx+=96)for(let gy=minY;gy<maxY;gy+=96){ctx.globalAlpha=.18;ctx.beginPath();ctx.arc(gx+35,gy+32,22,0,TAU);ctx.fill()}
+  ctx.globalAlpha=1;
+}
+ctx.strokeStyle='#365f42';ctx.lineWidth=10;ctx.strokeRect(MAP_MIN_X+5,MAP_MIN_Y+5,MAP_W-10,MAP_H-10);drawNpc();
+for(const ch of game.chests)drawChest(ch);for(const d of game.drops)drawDrop(d);for(const o of game.orbs)drawOrb(o);for(const s of game.shots)drawShot(s);for(const e of game.enemies)drawEnemy(e);if(game.boss)drawBoss(game.boss);drawShop();for(const s of game.slashes)drawSlash(s);drawPlayer();for(const p of game.particles){ctx.globalAlpha=Math.max(0,p.life/.8);ctx.fillStyle=p.col;ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size)}for(const t of game.texts){ctx.globalAlpha=Math.max(0,t.life/.8);ctx.fillStyle=t.col;ctx.font='bold 14px system-ui';ctx.textAlign='center';ctx.fillText(t.t,t.x,t.y)}ctx.globalAlpha=1;ctx.restore();drawOverlay();updateHUD()}
+function drawOverlay(){if(!game.levelChoices)return;ctx.save();if(game.levelChoices==='GAMEOVER'){ctx.fillStyle='#050816e8';ctx.fillRect(0,0,W,H);ctx.textAlign='center';ctx.fillStyle='#ffb7c7';ctx.font='900 42px system-ui';ctx.fillText('游戏结束',W/2,230);ctx.fillStyle='#e9efff';ctx.font='18px system-ui';ctx.fillText(`你坚持到了第 ${game.wave} 波 · Lv.${player.lv}`,W/2,275);ctx.fillStyle='#aeb9d6';ctx.font='14px system-ui';ctx.fillText(`击杀 ${game.kills} · 生存 ${Math.floor(game.elapsed)} 秒`,W/2,305);ctx.fillStyle='#13243a';ctx.strokeStyle='#d6a8ff';ctx.lineWidth=2;ctx.fillRect(W/2-270,350,240,110);ctx.strokeRect(W/2-270,350,240,110);ctx.fillRect(W/2+30,350,240,110);ctx.strokeRect(W/2+30,350,240,110);ctx.fillStyle='#fff';ctx.font='900 22px system-ui';ctx.fillText('1  重新开始',W/2-150,400);ctx.fillText('2  返回主菜单',W/2+150,400);ctx.font='13px system-ui';ctx.fillStyle='#aeb9d6';ctx.fillText('开启一局新的生存挑战',W/2-150,430);ctx.fillText('保留已有存档，可之后读取',W/2+150,430);ctx.restore();return}if(game.levelChoices==='MILESTONE'){ctx.fillStyle='#050816dd';ctx.fillRect(0,0,W,H);ctx.textAlign='center';ctx.fillStyle='#f4d9ff';ctx.font='900 34px system-ui';ctx.fillText(`第 ${game.wave} 波生存完成`,W/2,220);ctx.fillStyle='#d7e3f2';ctx.font='18px system-ui';ctx.fillText('你已经坚持到这里，可以结算里程碑或继续挑战更高波次。',W/2,265);ctx.fillStyle='#13243a';ctx.strokeStyle='#d6a8ff';ctx.lineWidth=2;ctx.fillRect(W/2-270,320,240,110);ctx.strokeRect(W/2-270,320,240,110);ctx.fillRect(W/2+30,320,240,110);ctx.strokeRect(W/2+30,320,240,110);ctx.fillStyle='#fff';ctx.font='900 22px system-ui';ctx.fillText('1  生存结算',W/2-150,370);ctx.fillText('2  继续挑战',W/2+150,370);ctx.font='13px system-ui';ctx.fillStyle='#aeb9d6';ctx.fillText('结算里程碑并保存',W/2-150,400);ctx.fillText('保存后继续无尽生存',W/2+150,400);ctx.restore();return}ctx.save();ctx.fillStyle='#050816cc';ctx.fillRect(0,0,W,H);ctx.textAlign='center';ctx.fillStyle='#fff';ctx.font='900 30px system-ui';ctx.fillText('升级！选择一个强化',W/2,145);ctx.font='14px system-ui';ctx.fillStyle='#aeb9d6';ctx.fillText(`Lv.${player.lv} · ${weaponDefs[player.weapon].short} Lv.${player.weaponLv[player.weapon]||1}/20 · 选择一项天赋`,W/2,173);const cw=300,ch=220,gap=24,start=W/2-(cw*3+gap*2)/2;game.levelChoices.forEach((s,i)=>{const x=start+i*(cw+gap),y=220;ctx.fillStyle='#111a30';ctx.strokeStyle='#6d5d9d';ctx.lineWidth=2;ctx.fillRect(x,y,cw,ch);ctx.strokeRect(x,y,cw,ch);ctx.fillStyle='#dcb4ff';ctx.font='900 20px system-ui';const tag=skillTag(s);ctx.fillText(`${i+1}. ${s.name}`,x+cw/2,y+48);ctx.fillStyle='#ffd76e';ctx.font='bold 12px system-ui';ctx.fillText(`【${tag}】 · Lv.${player.skillLevels[s.id]||0}/${s.maxLv||'∞'}`,x+cw/2,y+76);ctx.fillStyle='#e9efff';ctx.font='14px system-ui';wrapText(s.desc,x+cw/2,y+92,cw-45,25);ctx.fillStyle='#7c89aa';ctx.font='12px system-ui';ctx.fillText('按 1/2/3 或点击选择',x+cw/2,y+ch-28)});ctx.restore()}
+function wrapText(t,x,y,maxWidth,lineH){let line='';for(const ch of t){const test=line+ch;if(ctx.measureText(test).width>maxWidth&&line){ctx.fillText(line,x,y);line=ch;y+=lineH}else line=test}if(line)ctx.fillText(line,x,y)}
+function updateHUD(){const pct=n=>clamp(n,0,100);document.getElementById('hp').style.width=pct(player.hp/player.maxHp*100)+'%';document.getElementById('xp').style.width=pct(player.xp/player.next*100)+'%';const hpText=document.getElementById('hpText');if(hpText)hpText.textContent=`${Math.ceil(player.hp)}/${Math.ceil(player.maxHp)}`;const xpText=document.getElementById('xpText');if(xpText)xpText.textContent=`${Math.floor(player.xp)}/${Math.floor(player.next)}`;document.getElementById('lv').textContent=player.lv;document.getElementById('wave').textContent=game.wave;document.getElementById('kills').textContent=game.kills;const coinEl=document.getElementById('coins');if(coinEl)coinEl.textContent=player.coins;document.getElementById('weapon').textContent=weaponDefs[player.weapon].name+' Lv.'+(player.weaponLv[player.weapon]||1)+'/20 · 练度 '+(player.weaponKills[player.weapon]||0);document.getElementById('atk').textContent=Math.round(baseDamage(player.weapon));const critRateEl=document.getElementById('critRate');if(critRateEl)critRateEl.textContent=(player.crit*100).toFixed(0)+'%';const critDmgEl=document.getElementById('critDamage');if(critDmgEl)critDmgEl.textContent=(player.critDamage||1.5)*100+'%';const rateEl=document.getElementById('autoRate');if(rateEl)rateEl.textContent=(1/(weaponStats(player.weapon).rate*(1-player.rateBonus))).toFixed(1)+'/s';document.getElementById('status').textContent=`生存 ${Math.floor(game.elapsed)}s · 敌人 ${game.enemies.length}/50 · 自动攻击 · 波次 ${game.wave}`;for(let i=0;i<3;i++){const id=weaponOrder[i],el=document.getElementById('w'+i);if(!el)continue;el.classList.toggle('locked',!player.unlocked[id]);el.classList.toggle('active',player.weapon===id);el.textContent=(i+1)+' '+(player.unlocked[id]?weaponDefs[id].short:'???')}const ui=document.getElementById('bossUI');if(game.boss){ui.classList.remove('hidden');document.getElementById('bossName').textContent=`第 ${game.wave} 波 · 月蚀魔将${game.boss.phase?' · 暴走':''} → 玩家`;document.getElementById('bossHp').style.width=pct(game.boss.hp/game.boss.maxHp*100)+'%'}else ui.classList.add('hidden')}
+function loop(t,token=loopToken){if(!started||token!==loopToken)return;
+if(paused){last=t;timeAccumulator=0;draw();requestAnimationFrame(tt=>loop(tt,token));return;}const realDt=Math.min(.1,Math.max(0,(t-last)/1000));last=t;timeAccumulator+=realDt;const FIXED_DT=1/60;let steps=0;try{while(timeAccumulator>=FIXED_DT&&steps<3){update(FIXED_DT);timeAccumulator-=FIXED_DT;steps++}draw();}catch(err){console.error(err);started=false;const box=document.getElementById('start');box.classList.remove('hidden');document.getElementById('startTitle').textContent='游戏运行异常';document.getElementById('startDesc').innerHTML='已捕获运行错误，避免黑屏。<br>请点击“新游戏”重新开始。';toast('运行错误已拦截：'+err.message);return}requestAnimationFrame(t=>loop(t,token))}
+drawMenuForest();
+
+/* V52 农场系统：QQ农场式点击种田 + 农舍动物 + 鱼塘养鱼 */
+const FARM_KEY='kitsune_farm_v52';
+const farmCrops=[
+{id:'berry',name:'月莓',icon:'🍓',seed:20,grow:20,yield:1,sell:15,rarity:'普通'},
+{id:'mushroom',name:'星苔菇',icon:'🍄',seed:32,grow:25,yield:1,sell:25,rarity:'普通'},
+{id:'herb',name:'青叶草',icon:'🌿',seed:45,grow:30,yield:1,sell:34,rarity:'普通'},
+{id:'moonflower',name:'月光花',icon:'🌙',seed:70,grow:90,yield:1,sell:65,rarity:'稀有',unlock:10,buff:'本局攻击 +3%'},
+{id:'thornvine',name:'荆棘藤',icon:'🌱',seed:90,grow:120,yield:2,sell:42,rarity:'稀有',unlock:20,buff:'本局受伤降低 +4%'},
+{id:'dewgrass',name:'灵露草',icon:'💧',seed:120,grow:150,yield:2,sell:55,rarity:'稀有',unlock:30,buff:'本局攻击速度 +5%'},
+{id:'treefruit',name:'古树果',icon:'🍎',seed:260,grow:300,yield:2,sell:72,rarity:'传说',unlock:50,buff:'本局最大生命 +15%'},
+{id:'wolforchid',name:'狼魂兰',icon:'🌸',seed:360,grow:420,yield:3,sell:70,rarity:'传说',unlock:80,buff:'本局暴击率 +10%'},
+{id:'purifylotus',name:'净化莲',icon:'🪷',seed:500,grow:600,yield:4,sell:70,rarity:'传说',unlock:100,buff:'本局特殊效果 +25%'},
+{id:'forestheart',name:'森心果',icon:'🌳',seed:650,grow:540,yield:5,sell:78,rarity:'传说',unlock:150,buff:'本局全武器伤害 +8%'}];
+const farmFerts=[{id:'normal',name:'普通肥料',icon:'🧺',price:35,desc:'生长速度 +20%',unlock:0},{id:'nutrition',name:'营养肥料',icon:'🥕',price:55,desc:'成熟产出 +1',unlock:10},{id:'guardian',name:'守护肥料',icon:'🛡️',price:70,desc:'本次不枯萎',unlock:20}];
+const farmAnimals=[
+{id:'chicken',name:'月影鸡',icon:'🐔',price:80,cycle:45,product:'鸡蛋',productIcon:'🥚',sell:30,desc:'每45秒产出1个鸡蛋'},
+{id:'rabbit',name:'森林兔',icon:'🐇',price:140,cycle:70,product:'兔毛',productIcon:'🧶',sell:55,desc:'每70秒产出1份兔毛'},
+{id:'sheep',name:'月光羊',icon:'🐑',price:260,cycle:100,product:'羊毛',productIcon:'🧶',sell:95,desc:'每100秒产出1份羊毛'},
+{id:'cow',name:'森林奶牛',icon:'🐄',price:420,cycle:130,product:'牛奶',productIcon:'🥛',sell:150,desc:'每130秒产出1瓶牛奶'}];
+const farmFish=[
+{id:'carp',name:'月影鲤',icon:'🐟',price:60,cycle:40,sell:25,desc:'每40秒游出1条鱼'},
+{id:'koi',name:'樱月锦鲤',icon:'🐠',price:120,cycle:65,sell:55,desc:'每65秒产出1条锦鲤'},
+{id:'puffer',name:'星光河豚',icon:'🐡',price:220,cycle:95,sell:105,desc:'每95秒产出1条星光河豚'},
+{id:'moonfish',name:'月光鱼',icon:'🐟',price:380,cycle:130,sell:185,desc:'每130秒产出1条月光鱼'}];
+function farmDefault(){return{coins:0,plots:[{type:'house',locked:false,crop:null},{type:'pond',locked:false,crop:null},{type:'field',locked:false,crop:null},{locked:true},{locked:true},{locked:true}],seeds:{berry:6,mushroom:3},fert:{normal:1,nutrition:0,guardian:0},bag:{},animalBag:{},fishBag:{},animalProducts:{},fishProducts:{},matureAnimalBag:{},matureFishBag:{},selectedSeed:'berry',selectedPlot:2,buffs:{}}}
+let farm=farmDefault(),farmOpen=false,farmShop=null;
+const FarmSystem={
+load(){try{const raw=localStorage.getItem(FARM_KEY);if(raw){const d=JSON.parse(raw);farm=Object.assign(farmDefault(),d);const def=farmDefault();farm.plots=(d.plots||def.plots).map((x,i)=>{if(i===0)return {type:'house',locked:false,crop:null,animal:x?.animal||null};if(i===1)return {type:'pond',locked:false,crop:null,fish:x?.fish||null};if(i===2)return Object.assign({type:'field',locked:false,crop:null},x||{});return x||{locked:true}});farm.seeds=Object.assign({},def.seeds,d.seeds||{});farm.fert=Object.assign({},def.fert,d.fert||{});farm.bag=Object.assign({},d.bag||{});farm.animalBag=Object.assign({},d.animalBag||{});farm.fishBag=Object.assign({},d.fishBag||{});farm.animalProducts=Object.assign({},d.animalProducts||{});farm.fishProducts=Object.assign({},d.fishProducts||{});farm.matureAnimalBag=Object.assign({},d.matureAnimalBag||{});farm.matureFishBag=Object.assign({},d.matureFishBag||{})}}catch(e){}},
+save(){try{localStorage.setItem(FARM_KEY,JSON.stringify(farm))}catch(e){}},
+unlocked(c){return !c.unlock||Math.max(game.completedWaves||0,(game.wave||1)-1)>=c.unlock},
+progress(p){if(!p?.crop)return null;const c=farmCrops.find(x=>x.id===p.crop.id);const elapsed=(Date.now()-p.crop.plantedAt)/1000;const grow=c.grow*(p.crop.fast?.8:1);if(elapsed<grow)return['生长中',elapsed/grow];if(elapsed<grow*3||p.crop.guardian)return['成熟',1];return['枯萎',1]},
+plant(i,id){const p=farm.plots[i],c=farmCrops.find(x=>x.id===id);if(i<2||!p||p.locked||p.type!=='field'||p.crop||!c||!this.unlocked(c)||(farm.seeds[id]||0)<=0)return false;farm.seeds[id]--;p.crop={id,plantedAt:Date.now(),fast:false,nutrition:false,guardian:false};this.save();return true},
+harvest(i){const p=farm.plots[i];if(i<2||!p?.crop)return 0;const st=this.progress(p);if(!st||st[0]==='生长中')return 0;const c=farmCrops.find(x=>x.id===p.crop.id);let q=c.yield+(p.crop.nutrition?1:0);if(st[0]==='枯萎')q=Math.max(1,Math.floor(q/2));farm.bag[c.id]=(farm.bag[c.id]||0)+q;p.crop=null;this.save();return q},
+fertilize(i,id){const p=farm.plots[i],f=farmFerts.find(x=>x.id===id);if(i<2||!p?.crop||!f||(farm.fert[id]||0)<=0)return false;if(id==='normal'&&!p.crop.fast){p.crop.fast=true;farm.fert[id]--}else if(id==='nutrition'&&!p.crop.nutrition){p.crop.nutrition=true;farm.fert[id]--}else if(id==='guardian'&&!p.crop.guardian){p.crop.guardian=true;farm.fert[id]--}else return false;this.save();return true},
+buySeed(id){const c=farmCrops.find(x=>x.id===id);if(!c||!this.unlocked(c)||farm.coins<c.seed)return false;farm.coins-=c.seed;farm.seeds[id]=(farm.seeds[id]||0)+1;this.save();return true},
+buyFert(id){const f=farmFerts.find(x=>x.id===id);if(!f||Math.max(game.completedWaves||0,(game.wave||1)-1)<f.unlock||farm.coins<f.price)return false;farm.coins-=f.price;farm.fert[id]=(farm.fert[id]||0)+1;this.save();return true},
+buyAnimal(id){const a=farmAnimals.find(x=>x.id===id);if(!a||farm.coins<a.price)return false;farm.coins-=a.price;farm.animalBag[id]=(farm.animalBag[id]||0)+1;this.save();return true},
+buyFish(id){const f=farmFish.find(x=>x.id===id);if(!f||farm.coins<f.price)return false;farm.coins-=f.price;farm.fishBag[id]=(farm.fishBag[id]||0)+1;this.save();return true},
+placeAnimal(id){const a=farmAnimals.find(x=>x.id===id);const p=farm.plots[0];if(!a||!p||farm.plots[0].animal||!(farm.animalBag[id]>0))return false;farm.animalBag[id]--;p.animal={id,placedAt:Date.now(),lastProductAt:Date.now(),matureAt:Date.now()+30000};this.save();return true},
+placeFish(id){const f=farmFish.find(x=>x.id===id);const p=farm.plots[1];if(!f||!p||farm.plots[1].fish||!(farm.fishBag[id]>0))return false;farm.fishBag[id]--;p.fish={id,placedAt:Date.now(),lastProductAt:Date.now(),matureAt:Date.now()+40000};this.save();return true},
+collectAnimal(){const p=farm.plots[0];if(!p?.animal)return 0;const a=farmAnimals.find(x=>x.id===p.animal.id);const n=Math.floor((Date.now()-p.animal.lastProductAt)/1000/a.cycle);if(n>0){farm.animalProducts[a.id]=(farm.animalProducts[a.id]||0)+n;p.animal.lastProductAt+=n*a.cycle;this.save()}return n},
+collectFish(){const p=farm.plots[1];if(!p?.fish)return 0;const f=farmFish.find(x=>x.id===p.fish.id);const n=Math.floor((Date.now()-p.fish.lastProductAt)/1000/f.cycle);if(n>0){farm.fishProducts[f.id]=(farm.fishProducts[f.id]||0)+n;p.fish.lastProductAt+=n*f.cycle;this.save()}return n},harvestMatureAnimal(){const p=farm.plots[0];if(!p?.animal||!this.isAnimalMature())return false;const id=p.animal.id;farm.matureAnimalBag[id]=(farm.matureAnimalBag[id]||0)+1;p.animal=null;this.save();return true},harvestMatureFish(){const p=farm.plots[1];if(!p?.fish||!this.isFishMature())return false;const id=p.fish.id;farm.matureFishBag[id]=(farm.matureFishBag[id]||0)+1;p.fish=null;this.save();return true},isAnimalMature(){const a=farm.plots[0]?.animal;return !!a&&Date.now()>=(a.matureAt||a.placedAt+30000)},isFishMature(){const f=farm.plots[1]?.fish;return !!f&&Date.now()>=(f.matureAt||f.placedAt+40000)},sellAnimal(){const p=farm.plots[0];if(!p?.animal||!this.isAnimalMature())return false;const a=farmAnimals.find(x=>x.id===p.animal.id);farm.coins+=Math.floor(a.price*1.2);p.animal=null;this.save();return true},sellFish(){const p=farm.plots[1];if(!p?.fish||!this.isFishMature())return false;const f=farmFish.find(x=>x.id===p.fish.id);farm.coins+=Math.floor(f.price*1.2);p.fish=null;this.save();return true},
+add(n){farm.coins+=n;this.save()},
+expand(i){const price={3:500,4:1200,5:3000}[i];if(!price||!farm.plots[i]?.locked||farm.coins<price)return false;farm.coins-=price;farm.plots[i]={type:'field',locked:false,crop:null};this.save();return true},
+sellCrop(id){const c=farmCrops.find(x=>x.id===id);if(!c||!(farm.bag[id]>0))return false;farm.bag[id]--;farm.coins+=c.sell;this.save();return true},
+sellAnimalProduct(id){const a=farmAnimals.find(x=>x.id===id);if(!a||!(farm.animalProducts[id]>0))return false;farm.animalProducts[id]--;farm.coins+=a.sell;this.save();return true},
+sellFishProduct(id){const f=farmFish.find(x=>x.id===id);if(!f||!(farm.fishProducts[id]>0))return false;farm.fishProducts[id]--;farm.coins+=f.sell;this.save();return true},
+recycle(id){const c=farmCrops.find(x=>x.id===id);if(!c||!c.buff||!(farm.bag[id]>0))return false;farm.bag[id]--;farm.buffs[id]=(farm.buffs[id]||0)+1;this.save();return true}};
+window.FarmSystem=FarmSystem;FarmSystem.load();
+function farmUI(){if(document.getElementById('farmV52'))return;const d=document.createElement('div');d.id='farmV52';d.innerHTML=`<div class="f52top"><b>🌙 月影森林农场</b><span>🥕 种菜币 <strong id="f52coins">0</strong></span><span id="f52date"></span><button onclick="closeFarmV52()">返回战斗</button></div><div class="f52body"><div class="f52side"><button onclick="farmShopV52('seed')">🌱<b>种子商店</b><small>购买种子</small></button><button onclick="farmShopV52('fert')">🧺<b>肥料商店</b><small>购买肥料</small></button><button onclick="farmShopV52('animal')">🐔<b>动物商店</b><small>购买幼崽</small></button><button onclick="farmShopV52('fish')">🐟<b>鱼苗商店</b><small>购买鱼苗</small></button><button onclick="farmShopV52('bag')">📦<b>仓库</b><small>作物与产物</small></button><button onclick="farmShopV52('recycle')">♻️<b>回收站</b><small>出售 / 回收Buff</small></button></div><div class="f52field"><h2>🌾 我的农场 <small>农舍 · 鱼塘 · 菜地</small></h2><div id="f52plots"></div><div id="f52seeds"></div></div><div class="f52info"><h3>农场状态</h3><div id="f52info"></div><p>🌱 先选择种子，再点击菜地。<br>🐔 农舍放1只动物。<br>🐟 鱼塘放1种鱼。<br>🌾 成熟作物直接点击收获。</p><button onclick="collectFarmAnimalsV52()">🥚 收取动物产物</button><button onclick="collectFarmFishV52()">🐟 收取鱼塘产物</button><button onclick="harvestAllV52()">🌾 一键收获</button></div></div><div id="f52modal" class="f52modal hidden"></div>`;document.body.appendChild(d)}
+function openFarmV52(){farmUI();farmOpen=true;started=false;paused=false;document.getElementById('start')?.classList.add('hidden');document.getElementById('pauseBtn').style.display='none';document.getElementById('farmV52').classList.add('open');renderFarmV52()}
+function closeFarmV52(){farmOpen=false;farmShop=null;document.getElementById('farmV52')?.classList.remove('open');document.getElementById('pauseBtn').style.display='';returnMenu()}
+function renderFarmV52(){if(!farmOpen)return;FarmSystem.collectAnimal();FarmSystem.collectFish();document.getElementById('f52coins').textContent=farm.coins;document.getElementById('f52date').textContent=new Date().toLocaleDateString('zh-CN')+' · '+farmSeasonV52();document.getElementById('f52plots').innerHTML=farm.plots.map((p,i)=>{if(i===0){const a=p.animal&&farmAnimals.find(x=>x.id===p.animal.id);return `<button class="f52plot special" onclick="farmShopV52('animalBag')"><span>🏡</span><b>农舍</b><small>${a?a.icon+' '+a.name:'点击购买并安置动物'}</small><em>${a?(FarmSystem.isAnimalMature()?'已成熟 · 点击查看仓库/出售':'幼崽期 · 正在成长'):'点击进入幼崽仓库'}</em></button>`}if(i===1){const f=p.fish&&farmFish.find(x=>x.id===p.fish.id);return `<button class="f52plot special pond" onclick="farmShopV52('fishBag')"><span>💧</span><b>鱼塘</b><small>${f?f.icon+' '+f.name:'点击购买并放入鱼塘'}</small><em>${f?(FarmSystem.isFishMature()?'已成熟 · 点击查看仓库/出售':'鱼苗期 · 正在成长'):'点击进入鱼苗仓库'}</em></button>`}if(p?.locked)return `<button class="f52plot locked" onclick="expandFarmV52(${i})">🔒<b>第 ${i+1} 块菜地</b><small>扩建 ${[500,1200,3000][i-3]} 种菜币</small></button>`;if(!p?.crop){const c=farmCrops.find(x=>x.id===farm.selectedSeed)||farmCrops[0];return `<button class="f52plot empty" onclick="plantFarmV52(${i})"><b>＋</b><strong>空闲菜地</strong><small>点击种 ${c.icon}${c.name}</small></button>`}const c=farmCrops.find(x=>x.id===p.crop.id)||farmCrops[0],st=FarmSystem.progress(p);return `<button class="f52plot crop" onclick="clickFarmPlotV52(${i})"><span>${c.icon}</span><b>${c.name}</b><small>${st[0]}</small><i><em style="width:${Math.min(100,st[1]*100)}%"></em></i><small>${Math.floor(Math.min(1,st[1])*100)}%</small></button>`}).join('');document.getElementById('f52seeds').innerHTML=farmCrops.filter(c=>FarmSystem.unlocked(c)).map(c=>`<button class="f52seed ${farm.selectedSeed===c.id?'sel':''}" onclick="selectFarmSeedV52('${c.id}')">${c.icon} ${c.name}<small>×${farm.seeds[c.id]||0}</small></button>`).join('');const a=farm.plots[0].animal&&farmAnimals.find(x=>x.id===farm.plots[0].animal.id),f=farm.plots[1].fish&&farmFish.find(x=>x.id===farm.plots[1].fish.id);document.getElementById('f52info').innerHTML=`当前种子：<b>${(farmCrops.find(c=>c.id===farm.selectedSeed)||farmCrops[0]).name}</b><br>仓库作物：${Object.values(farm.bag).reduce((x,y)=>x+y,0)} 个<br>农舍：${a?a.name:'空'}<br>鱼塘：${f?f.name:'空'}<br>动物产物：${Object.values(farm.animalProducts).reduce((x,y)=>x+y,0)} 个<br>鱼类产物：${Object.values(farm.fishProducts).reduce((x,y)=>x+y,0)} 个`;if(farmShop)renderFarmShopV52(farmShop)}
+function farmSeasonV52(){const m=new Date().getMonth()+1;return m<=3?'春芽季':m<=6?'盛夏季':m<=9?'秋叶季':'月影季'}
+function selectFarmSeedV52(id){farm.selectedSeed=id;FarmSystem.save();renderFarmV52()}
+function plantFarmV52(i){const ok=FarmSystem.plant(i,farm.selectedSeed);toast(ok?'🌱 已种下作物':'没有该种子或这不是菜地');renderFarmV52()}
+function clickFarmPlotV52(i){const p=farm.plots[i],st=FarmSystem.progress(p);farm.selectedPlot=i;if(st?.[0]==='成熟'||st?.[0]==='枯萎'){const q=FarmSystem.harvest(i);toast(q?'🌾 收获 '+q+' 个作物':'');renderFarmV52()}else{farmShop='fert';document.getElementById('f52modal').classList.remove('hidden');renderFarmShopV52('fert')}}
+function expandFarmV52(i){toast(FarmSystem.expand(i)?'🌾 菜地扩建成功':'种菜币不足');renderFarmV52()}
+function harvestAllV52(){let n=0;for(let i=2;i<farm.plots.length;i++)n+=FarmSystem.harvest(i);if(FarmSystem.harvestMatureAnimal())n++;if(FarmSystem.harvestMatureFish())n++;toast(n?'🌾 一键收获 '+n+' 个（含成熟动物/鱼）':'没有可收获内容');renderFarmV52()}
+function collectFarmAnimalsV52(){const n=FarmSystem.collectAnimal();toast(n?'🥚 收取 '+n+' 个动物产物':'暂时没有产物');renderFarmV52()}
+function collectFarmFishV52(){const n=FarmSystem.collectFish();toast(n?'🐟 收取 '+n+' 个鱼类产物':'暂时没有产物');renderFarmV52()}
+function farmShopV52(kind){farmShop=kind;document.getElementById('f52modal').classList.remove('hidden');renderFarmShopV52(kind)}
+function closeFarmShopV52(){farmShop=null;document.getElementById('f52modal').classList.add('hidden');renderFarmV52()}
+function sellAllFarmV53(){
+  let sold=0,total=0;
+  const sellStack=(arr,bag,key,unitFn)=>{arr.forEach(x=>{const n=Math.max(0,Math.floor(bag[x.id]||0));if(n){const unit=unitFn(x);bag[x.id]=0;sold+=n;total+=n*unit}})};
+  sellStack(farmCrops,farm.bag,'bag',x=>x.sell);
+  sellStack(farmAnimals,farm.animalProducts,'animalProducts',x=>x.sell);
+  sellStack(farmFish,farm.fishProducts,'fishProducts',x=>x.sell);
+  sellStack(farmAnimals,farm.matureAnimalBag,'matureAnimalBag',x=>Math.floor(x.price*1.2));
+  sellStack(farmFish,farm.matureFishBag,'matureFishBag',x=>Math.floor(x.price*1.2));
+  if(total>0){farm.coins+=total;FarmSystem.save();toast(`💰 全部出售 ${sold} 个，共 +${total} 种菜币`)}else{toast('没有可出售库存')}
+  renderFarmShopV52('bag');renderFarmV52();
+}
+function renderFarmShopV52(kind){const m=document.getElementById('f52modal');let title='',cards='';if(kind==='seed'){title='🌱 种子商店';cards=farmCrops.map(c=>`<button ${FarmSystem.unlocked(c)?'':'disabled'} onclick="buyFarmSeedV52('${c.id}')">${c.icon} <b>${c.name}</b><small>${c.rarity} · ${c.seed} 种菜币 · 生长 ${c.grow}秒 · 售价 ${c.sell}</small></button>`).join('')}else if(kind==='fert'){title='🧺 肥料商店';cards=farmFerts.map(f=>`<button onclick="buyFarmFertV52('${f.id}')">${f.icon} <b>${f.name}</b><small>${f.desc} · ${f.price} 种菜币 · 持有 ${farm.fert[f.id]||0}</small></button>`).join('')}else if(kind==='animal'){title='🐣 幼崽商店';cards=farmAnimals.map(a=>`<button onclick="buyFarmAnimalV52('${a.id}')">${a.icon} <b>${a.name}幼崽</b><small>购买 ${a.price} · 成熟30秒 · ${a.desc} · 库存 ${farm.animalBag[a.id]||0}</small></button>`).join('');cards+=`<button onclick="farmShopV52('animalBag')">🏡 进入农舍仓库<small>直接选择幼崽放入农舍</small></button>`}else if(kind==='fish'){title='🐟 鱼苗商店';cards=farmFish.map(f=>`<button onclick="buyFarmFishV52('${f.id}')">${f.icon} <b>${f.name}鱼苗</b><small>购买 ${f.price} · 成熟40秒 · ${f.desc} · 库存 ${farm.fishBag[f.id]||0}</small></button>`).join('');cards+=`<button onclick="farmShopV52('fishBag')">💧 进入鱼塘仓库<small>直接选择鱼苗放入鱼塘</small></button>`}else if(kind==='animalBag'){title='🏡 农舍仓库 · 幼崽';cards=farmAnimals.filter(a=>(farm.animalBag[a.id]||0)>0).map(a=>`<button onclick="placeFarmAnimalV52('${a.id}')">${a.icon} <b>${a.name}幼崽 ×${farm.animalBag[a.id]}</b><small>点击放入农舍 · 入住后30秒成熟</small></button>`).join('')||'<p>仓库里没有幼崽，请先去动物商店购买。</p>'}else if(kind==='fishBag'){title='💧 鱼塘仓库 · 鱼苗';cards=farmFish.filter(f=>(farm.fishBag[f.id]||0)>0).map(f=>`<button onclick="placeFarmFishV52('${f.id}')">${f.icon} <b>${f.name}鱼苗 ×${farm.fishBag[f.id]}</b><small>点击放入鱼塘 · 入塘后40秒成熟</small></button>`).join('')||'<p>仓库里没有鱼苗，请先去鱼苗商店购买。</p>'}else if(kind==='bag'){title='📦 仓库';
+ cards=`<div class="sellAllBar"><button onclick="sellAllFarmV53()">💰 全部出售</button><small>一次出售仓库内所有可出售物品</small></div>`;
+ cards+=farmCrops.filter(c=>(farm.bag[c.id]||0)>0).map(c=>`<div class=\"bagCard\"><div><b>${c.icon} ${c.name} ×${farm.bag[c.id]}</b><small>作物 · 单价 ${c.sell}</small></div><small>单价 ${c.sell}</small></div>`).join('');
+ cards+=farmAnimals.filter(a=>(farm.animalProducts[a.id]||0)>0).map(a=>`<div class=\"bagCard\"><div><b>${a.productIcon} ${a.product} ×${farm.animalProducts[a.id]}</b><small>动物产物 · 单价 ${a.sell}</small></div><small>单价 ${a.sell}</small></div>`).join('');
+ cards+=farmFish.filter(f=>(farm.fishProducts[f.id]||0)>0).map(f=>`<div class=\"bagCard\"><div><b>${f.icon} ${f.name} ×${farm.fishProducts[f.id]}</b><small>鱼类产物 · 单价 ${f.sell}</small></div><small>单价 ${f.sell}</small></div>`).join('');
+ cards+=farmAnimals.filter(a=>(farm.matureAnimalBag[a.id]||0)>0).map(a=>`<div class=\"bagCard mature\"><div><b>${a.icon} 成熟${a.name} ×${farm.matureAnimalBag[a.id]}</b><small>成熟动物 · 单只售价 ${Math.floor(a.price*1.2)}</small></div><small>单只售价 ${Math.floor(a.price*1.2)}</small></div>`).join('');
+ cards+=farmFish.filter(f=>(farm.matureFishBag[f.id]||0)>0).map(f=>`<div class=\"bagCard mature pondBag\"><div><b>${f.icon} 成熟${f.name} ×${farm.matureFishBag[f.id]}</b><small>成熟鱼 · 单条售价 ${Math.floor(f.price*1.2)}</small></div><small>单条售价 ${Math.floor(f.price*1.2)}</small></div>`).join('');
+ if(!cards)cards='<p>仓库为空</p>'
+}else{title='♻️ 回收站';cards=farmCrops.filter(c=>(farm.bag[c.id]||0)>0).map(c=>`<button onclick="recycleFarmV52('${c.id}')">${c.icon} <b>${c.name} ×${farm.bag[c.id]}</b><small>${c.buff||'只能出售'}</small></button>`).join('')||'<p>没有可回收作物</p>'}m.innerHTML=`<div class="f52modalcard"><h2>${title}</h2><div class="f52cards">${cards}</div><button onclick="closeFarmShopV52()">关闭</button></div>`}
+function buyFarmSeedV52(id){toast(FarmSystem.buySeed(id)?'购买成功':'种菜币不足或未解锁');renderFarmShopV52('seed');renderFarmV52()}
+function buyFarmFertV52(id){toast(FarmSystem.buyFert(id)?'购买成功':'种菜币不足或未解锁');renderFarmShopV52('fert');renderFarmV52()}
+function buyFarmAnimalV52(id){toast(FarmSystem.buyAnimal(id)?'🐔 购买动物成功':'种菜币不足');renderFarmShopV52('animal');renderFarmV52()}
+function buyFarmFishV52(id){toast(FarmSystem.buyFish(id)?'🐟 购买鱼苗成功':'种菜币不足');renderFarmShopV52('fish');renderFarmV52()}
+function placeFarmAnimalV52(id){toast(FarmSystem.placeAnimal(id)?'🏡 幼崽已直接入住农舍':'农舍已有动物或库存不足');renderFarmShopV52('animalBag');renderFarmV52()}
+function placeFarmFishV52(id){toast(FarmSystem.placeFish(id)?'💧 鱼苗已直接放入鱼塘':'鱼塘已有鱼或库存不足');renderFarmShopV52('fishBag');renderFarmV52()}
+function sellFarmV52(id){toast(FarmSystem.sellCrop(id)?'出售成功':'没有库存');renderFarmShopV52('bag')}
+function sellAnimalProductV52(id){toast(FarmSystem.sellAnimalProduct(id)?'动物产物已出售':'没有库存');renderFarmShopV52('bag')}
+function sellFishProductV52(id){toast(FarmSystem.sellFishProduct(id)?'鱼类产物已出售':'没有库存');renderFarmShopV52('bag')}
+function sellMatureAnimalBagV52(id){const a=farmAnimals.find(x=>x.id===id);if(!a||!(farm.matureAnimalBag[id]>0)){toast('没有成熟动物库存');return}farm.matureAnimalBag[id]--;farm.coins+=Math.floor(a.price*1.2);FarmSystem.save();toast('🐔 成熟动物已出售');renderFarmShopV52('bag')}
+function sellMatureFishBagV52(id){const f=farmFish.find(x=>x.id===id);if(!f||!(farm.matureFishBag[id]>0)){toast('没有成熟鱼库存');return}farm.matureFishBag[id]--;farm.coins+=Math.floor(f.price*1.2);FarmSystem.save();toast('🐟 成熟鱼已出售');renderFarmShopV52('bag')}
+function sellMatureAnimalV52(){toast(FarmSystem.sellAnimal()?'🐔 成熟动物已出售':'动物还未成熟');renderFarmShopV52('animalBag');renderFarmV52()}
+function sellMatureFishV52(){toast(FarmSystem.sellFish()?'🐟 成熟鱼已出售':'鱼还未成熟');renderFarmShopV52('fishBag');renderFarmV52()}
+function recycleFarmV52(id){toast(FarmSystem.recycle(id)?'已回收为Buff':'该作物不能回收');renderFarmShopV52('recycle')}
+window.openFarmV52=openFarmV52;window.closeFarmV52=closeFarmV52;window.farmShopV52=farmShopV52;window.closeFarmShopV52=closeFarmShopV52;window.selectFarmSeedV52=selectFarmSeedV52;window.plantFarmV52=plantFarmV52;window.clickFarmPlotV52=clickFarmPlotV52;window.expandFarmV52=expandFarmV52;window.harvestAllV52=harvestAllV52;window.collectFarmAnimalsV52=collectFarmAnimalsV52;window.collectFarmFishV52=collectFarmFishV52;window.buyFarmSeedV52=buyFarmSeedV52;window.buyFarmFertV52=buyFarmFertV52;window.buyFarmAnimalV52=buyFarmAnimalV52;window.buyFarmFishV52=buyFarmFishV52;window.placeFarmAnimalV52=placeFarmAnimalV52;window.placeFarmFishV52=placeFarmFishV52;window.sellMatureAnimalV52=sellMatureAnimalV52;window.sellMatureFishV52=sellMatureFishV52;window.sellMatureAnimalBagV52=sellMatureAnimalBagV52;window.sellMatureFishBagV52=sellMatureFishBagV52;window.sellAllFarmV53=sellAllFarmV53;window.sellFarmV52=sellFarmV52;window.sellAnimalProductV52=sellAnimalProductV52;window.sellFishProductV52=sellFishProductV52;window.recycleFarmV52=recycleFarmV52;
+const _drawV52=draw;draw=function(){if(farmOpen){ctx.clearRect(0,0,W,H);ctx.fillStyle='#285d34';ctx.fillRect(0,0,W,H);for(let x=0;x<W;x+=130)for(let y=80;y<H;y+=150){ctx.fillStyle='#3b7841';ctx.beginPath();ctx.arc(x+40,y+28,30,0,TAU);ctx.arc(x+15,y+52,20,0,TAU);ctx.arc(x+65,y+52,22,0,TAU);ctx.fill()}return}_drawV52()};
+
+})();
